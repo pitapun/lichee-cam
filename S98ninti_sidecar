@@ -1,0 +1,47 @@
+#!/bin/sh
+# NintiDetect sidecar — starts stream_yolo + web UI on :7778.
+# Runs INSTEAD OF S99gc4653rtsp (both use VPSS group 0).
+# To switch modes:  enable this, disable S99gc4653rtsp, reboot.
+
+NAME=ninti_sidecar
+SIDECAR=/root/sidecar.py
+LOG=/tmp/ninti_sidecar.log
+PIDFILE=/tmp/ninti_sidecar.pid
+
+export LD_LIBRARY_PATH=/mnt/system/usr/lib:/usr/bin/lib:/root/libs_patch
+
+start() {
+    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+        echo "$NAME already running"
+        return
+    fi
+    echo "Starting $NAME..."
+    python3 "$SIDECAR" >"$LOG" 2>&1 &
+    echo $! >"$PIDFILE"
+    echo "$NAME started (PID $(cat $PIDFILE))"
+}
+
+stop() {
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE")
+        echo "Stopping stream_yolo first (VPSS cleanup)..."
+        curl -s -m 10 -X POST http://127.0.0.1:7778/api/yolo/stop >/dev/null 2>&1
+        sleep 1
+        echo "Stopping $NAME (PID $PID)..."
+        kill $PID 2>/dev/null
+        for i in $(seq 1 12); do
+            kill -0 $PID 2>/dev/null || break
+            sleep 1
+        done
+        kill -9 $PID 2>/dev/null
+        rm -f "$PIDFILE"
+        echo "$NAME stopped"
+    fi
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop  ;;
+    restart) stop; sleep 1; start ;;
+    *)       echo "Usage: $0 {start|stop|restart}" ;;
+esac
