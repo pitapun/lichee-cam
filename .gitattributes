@@ -1,0 +1,4 @@
+*.cvimodel filter=lfs diff=lfs merge=lfs -text
+*.so filter=lfs diff=lfs merge=lfs -text
+bin/stream_yolo filter=lfs diff=lfs merge=lfs -text
+bin/mediamtx filter=lfs diff=lfs merge=lfs -text
