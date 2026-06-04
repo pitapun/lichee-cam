@@ -31,6 +31,8 @@ DEFAULT_CONFIG = {
     'threshold': 0.50,
     'zones': [],
     'filter_classes': ['person', 'vehicle', 'animal'],
+    'motion_enabled': True,
+    'motion_sensitivity': 20,
 }
 
 # ---- State ----
@@ -252,7 +254,7 @@ def _start_yolo_inner():
         print(f'[yolo] starting with threshold={thresh}')
         yolo_log = open('/tmp/stream_yolo.log', 'w')
         yolo_proc = subprocess.Popen(
-            [STREAM_BIN, MODEL, '80', '640', thresh, str(UDP_PORT), '640', '360'],
+            [STREAM_BIN, MODEL, '80', '640', thresh, str(UDP_PORT), '1280', '720'],
             env=env, stdout=yolo_log, stderr=yolo_log)
 
 def start_yolo():
@@ -334,11 +336,17 @@ def _motion_detector():
                     jpg = buf[s:e + 2]
                     buf = buf[e + 2:]
                     try:
+                        with config_lock:
+                            motion_on  = cfg.get('motion_enabled', True)
+                            sensitivity = cfg.get('motion_sensitivity', MOTION_SENSITIVITY)
+                        if not motion_on:
+                            prev_gray = None
+                            continue
                         img = Image.open(io.BytesIO(jpg)).convert('L').resize((80, 45))
                         pixels = list(img.getdata())
                         if prev_gray is not None:
                             changed = sum(1 for a, b in zip(pixels, prev_gray)
-                                          if abs(a - b) > MOTION_SENSITIVITY)
+                                          if abs(a - b) > sensitivity)
                             if changed >= MOTION_MIN_PIXELS:
                                 now = time.time()
                                 if now - last_fire > MOTION_COOLDOWN:
@@ -387,6 +395,12 @@ def udp_listener():
             continue
         try:
             det = json.loads(data)
+            if '_fps' in det:
+                msg = 'data: ' + json.dumps(det) + '\n\n'
+                for q in list(sse_clients):
+                    try: q.put_nowait(msg)
+                    except: pass
+                continue
             with config_lock:
                 zones = cfg.get('zones', [])
                 filt  = cfg.get('filter_classes', [])
@@ -502,6 +516,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
     <div class="st-row"><span class="st-label">detector</span><span class="st-val off" id="stYolo">-</span></div>
     <div class="st-row"><span class="st-label">tracks</span><span class="st-val" id="stTracks">0</span></div>
     <div class="st-row"><span class="st-label">threshold</span><span class="st-val" id="stThresh">-</span></div>
+    <div class="st-row"><span class="st-label">fps</span><span class="st-val" id="stFps">-</span></div>
     <div class="st-row"><span class="st-label">last det</span><span class="st-val" id="stLastDet" style="font-size:10px;line-height:1.4">-</span></div>
   </div>
 </div>
@@ -545,6 +560,20 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   <span id="thv" style="width:32px">0.45</span>
 </div>
 <button onclick="applyThresh()" style="margin-top:4px;width:100%">Apply &amp; restart detector</button>
+</div>
+
+<div>
+<h2>MOTION DETECT</h2>
+<div class="row" style="margin-bottom:4px">
+  <button id="btnMotion" onclick="toggleMotion()" style="flex:1">-</button>
+</div>
+<div class="row">
+  <span class="hint" style="width:60px">sensitivity</span>
+  <input type="range" id="mth" min="5" max="50" step="5" value="20" style="flex:1"
+         oninput="document.getElementById('mthv').textContent=this.value">
+  <span id="mthv" style="width:28px">20</span>
+</div>
+<button onclick="applyMotion()" style="margin-top:4px;width:100%">Apply</button>
 </div>
 
 <div>
@@ -619,6 +648,10 @@ function loadConf(){
       document.getElementById('thv').textContent=parseFloat(c.threshold).toFixed(2);
       document.querySelectorAll('input[name=mode]').forEach(r=>{r.checked=(r.value===pendingMode);});
       updateModeLabels();
+      const ms=c.motion_sensitivity||20;
+      document.getElementById('mth').value=ms;
+      document.getElementById('mthv').textContent=ms;
+      updateMotionBtn();
       renderZones(); renderClasses();
     }).catch(e=>setStatus('load config failed: '+e));
 }
@@ -652,6 +685,27 @@ function loadEvents(){
     });
 }
 
+function toggleMotion(){
+  cfg.motion_enabled=!cfg.motion_enabled;
+  updateMotionBtn();
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({motion_enabled:cfg.motion_enabled})
+  }).catch(e=>setStatus(''+e));
+}
+function applyMotion(){
+  cfg.motion_sensitivity=parseInt(document.getElementById('mth').value);
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({motion_sensitivity:cfg.motion_sensitivity})
+  }).then(()=>setStatus('Motion settings saved.')).catch(e=>setStatus(''+e));
+}
+function updateMotionBtn(){
+  const btn=document.getElementById('btnMotion');
+  if(!btn)return;
+  btn.textContent=cfg.motion_enabled?'Enabled (click to disable)':'Disabled (click to enable)';
+  btn.className=cfg.motion_enabled?'act':'red';
+}
 function applyThresh(){
   cfg.threshold=parseFloat(document.getElementById('th').value);
   fetch('http://'+ip+':7778/api/config',{
@@ -723,7 +777,7 @@ function pollStatus(){
 function openSSE(){
   if(es)es.close();
   es=new EventSource('http://'+ip+':7778/events');
-  es.onmessage=e=>{try{const d=JSON.parse(e.data);if(d._motion)onMotion(d);else if(d._save)onSave(d);else if(d._discard)onDiscard(d);else onDet(d);}catch{}};
+  es.onmessage=e=>{try{const d=JSON.parse(e.data);if(d._fps!==undefined)onFps(d);else if(d._motion)onMotion(d);else if(d._save)onSave(d);else if(d._discard)onDiscard(d);else onDet(d);}catch{}};
   es.onopen=()=>setStatus('Connected');
   es.onerror=()=>setStatus('SSE offline, retrying...');
 }
@@ -757,6 +811,10 @@ function pnClear(id){
   if(arr)arr.className='parrow';
 }
 
+function onFps(d){
+  const el=document.getElementById('stFps');
+  if(el) el.textContent=d._fps.toFixed(1)+' fps';
+}
 function onDet(d){
   const log=document.getElementById('log');
   const ln=document.createElement('div');
