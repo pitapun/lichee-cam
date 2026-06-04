@@ -148,6 +148,12 @@ int main(int argc, char *argv[]) {
     char buf[512];
     int fps_frames = 0;
     long fps_last = now_ms();
+
+    struct TileDet { int dx1,dy1,dx2,dy2; float score; int cls; };
+    std::vector<TileDet> tile_cache[2]; // cached dets per tile (interleaved)
+    int active_tile = 0;
+    cv::Mat tile_sq;  // pre-allocated, reused each frame
+
     while (!interrupted) {
         cv::Mat frame;
         std::pair<void *, void *> imagePtrs = cap.capture(frame);
@@ -158,19 +164,18 @@ int main(int argc, char *argv[]) {
         cv::rotate(disp, disp, cv::ROTATE_180);
 
         long ts = now_ms();
-        const int tile_w = disp.cols / 2;          // 640 for 1280-wide display
-        const float ty_scale = (float)disp.rows / infer_size; // y scale tile→display
+        const int tile_w = disp.cols / 2;
+        const float ty_scale = (float)disp.rows / infer_size;
 
-        // Per-detection in display coords for cross-tile NMS
-        struct TileDet { int dx1,dy1,dx2,dy2; float score; int cls; };
-        std::vector<TileDet> all_dets;
-
-        for (int t = 0; t < 2; t++) {
+        // Interleaved: infer one tile per frame, use cache for the other
+        {
+            int t = active_tile;
             cv::Mat tile_region = disp(cv::Rect(t * tile_w, 0, tile_w, disp.rows));
-            cv::Mat tile_sq;
-            cv::resize(tile_region, tile_sq, cv::Size(infer_size, infer_size));
+            cv::resize(tile_region, tile_sq, cv::Size(infer_size, infer_size),
+                       0, 0, cv::INTER_NEAREST);
 
             cvtdl_object_t objs = detector.detect(tile_sq);
+            tile_cache[t].clear();
             for (uint32_t i = 0; i < objs.size; i++) {
                 if (!category(objs.info[i].classes)) continue;
                 TileDet td;
@@ -180,10 +185,16 @@ int main(int argc, char *argv[]) {
                 td.dy2 = (int)(objs.info[i].bbox.y2 * ty_scale);
                 td.score = objs.info[i].bbox.score;
                 td.cls   = objs.info[i].classes;
-                all_dets.push_back(td);
+                tile_cache[t].push_back(td);
             }
             detector.free_objects(&objs);
+            active_tile = 1 - active_tile;
         }
+
+        // Merge both tile caches
+        std::vector<TileDet> all_dets;
+        all_dets.insert(all_dets.end(), tile_cache[0].begin(), tile_cache[0].end());
+        all_dets.insert(all_dets.end(), tile_cache[1].begin(), tile_cache[1].end());
 
         // Cross-tile NMS: suppress lower-score duplicate that overlaps >40% IoU
         std::vector<bool> suppressed(all_dets.size(), false);
@@ -227,7 +238,10 @@ int main(int argc, char *argv[]) {
                         cv::FONT_HERSHEY_DUPLEX, 0.6, cv::Scalar(0,255,0), 1);
         }
 
-        mjpeg.write(disp);
+        // Scale down for MJPEG: boxes drawn at 1280x720, stream at 640x360
+        cv::Mat disp_out;
+        cv::resize(disp, disp_out, cv::Size(disp.cols/2, disp.rows/2));
+        mjpeg.write(disp_out);
 
         fps_frames++;
         long now = now_ms();

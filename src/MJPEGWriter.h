@@ -59,7 +59,7 @@ class MJPEGWriter{
         {
         	try
         	{
-        		int retval = ::send(sock, s, len, 0x4000);
+        		int retval = ::send(sock, s, len, 0x4000 | MSG_DONTWAIT);
         		return retval;
         	}
         	catch (int e)

@@ -307,11 +307,14 @@ MOTION_SENSITIVITY = 20   # pixel diff threshold per channel (0-255)
 MOTION_MIN_PIXELS  = 500  # min changed pixels to count as motion
 MOTION_COOLDOWN    = 0.3  # seconds between motion SSE events
 
+MOTION_CHECK_INTERVAL = 0.20  # only process one frame per 200ms; keep MJPEG queue free
+
 def _motion_detector():
     from PIL import Image
     import http.client as _hc
     prev_gray = None
     last_fire  = 0.0
+    last_check = 0.0
     while True:
         try:
             conn = _hc.HTTPConnection('127.0.0.1', MJPEG_PORT, timeout=5)
@@ -342,6 +345,11 @@ def _motion_detector():
                         if not motion_on:
                             prev_gray = None
                             continue
+                        # Rate-limit: skip frames to avoid blocking the MJPEG write queue
+                        now_t = time.time()
+                        if now_t - last_check < MOTION_CHECK_INTERVAL:
+                            continue
+                        last_check = now_t
                         img = Image.open(io.BytesIO(jpg)).convert('L').resize((80, 45))
                         pixels = list(img.getdata())
                         if prev_gray is not None:

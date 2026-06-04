@@ -429,24 +429,33 @@ cvtdl_object_t YoloModelDetector::detect(const cv::Mat& bgr_tile) {
     bool inp_fp32 = (inputs[0].fmt == CVI_FMT_FP32);
     memset(input_ptr, 0, CVI_NN_TensorSize(&inputs[0]));
 
-    // BGR interleaved → RGB planar (model plane order: 0=R, 1=G, 2=B)
-    std::vector<cv::Mat> ch;
-    cv::split(bgr_tile, ch);
-    const int src_plane[3] = {2, 1, 0};
-    for (int c = 0; c < 3; ++c) {
-        const cv::Mat& src = ch[src_plane[c]];
-        if (inp_fp32) {
-            float *dst = (float*)input_ptr + c * input_size * input_size;
-            for (int y = 0; y < copy_h; ++y) {
-                const unsigned char *row = src.ptr<unsigned char>(y);
-                float *out = dst + y * input_size;
-                for (int x = 0; x < copy_w; ++x)
-                    out[x] = (float)row[x] / 255.0f;
+    // BGR interleaved → RGB planar in a single pass (avoids cv::split allocation)
+    // Model plane order: 0=R, 1=G, 2=B; source BGR byte order: B=0,G=1,R=2
+    const unsigned char *bgr = bgr_tile.data;
+    const int bstride = (int)bgr_tile.step;
+    if (inp_fp32) {
+        float *dstR = (float*)input_ptr + 0 * input_size * input_size;
+        float *dstG = (float*)input_ptr + 1 * input_size * input_size;
+        float *dstB = (float*)input_ptr + 2 * input_size * input_size;
+        for (int y = 0; y < copy_h; ++y) {
+            const unsigned char *row = bgr + y * bstride;
+            for (int x = 0; x < copy_w; ++x) {
+                dstR[y*input_size+x] = row[x*3+2] / 255.0f;
+                dstG[y*input_size+x] = row[x*3+1] / 255.0f;
+                dstB[y*input_size+x] = row[x*3+0] / 255.0f;
             }
-        } else {
-            unsigned char *dst = (unsigned char*)input_ptr + c * input_size * input_size;
-            for (int y = 0; y < copy_h; ++y)
-                memcpy(dst + y * input_size, src.ptr<unsigned char>(y), copy_w);
+        }
+    } else {
+        unsigned char *dstR = (unsigned char*)input_ptr + 0 * input_size * input_size;
+        unsigned char *dstG = (unsigned char*)input_ptr + 1 * input_size * input_size;
+        unsigned char *dstB = (unsigned char*)input_ptr + 2 * input_size * input_size;
+        for (int y = 0; y < copy_h; ++y) {
+            const unsigned char *row = bgr + y * bstride;
+            for (int x = 0; x < copy_w; ++x) {
+                dstR[y*input_size+x] = row[x*3+2];
+                dstG[y*input_size+x] = row[x*3+1];
+                dstB[y*input_size+x] = row[x*3+0];
+            }
         }
     }
 
