@@ -109,7 +109,7 @@ public:
     MJPEGWriter(int port = 0)
         : sock(INVALID_SOCKET)
         , timeout(TIMEOUT_M)
-        , quality(90)
+        , quality(55)
 	, port(port)
     {
         signal(SIGPIPE, SIG_IGN);
@@ -134,6 +134,8 @@ public:
     bool open()
     {
         sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        int yes = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
         SOCKADDR_IN address;
         address.sin_addr.s_addr = INADDR_ANY;
@@ -177,6 +179,13 @@ public:
     		lastFrame = frame.clone();
     	}
     	pthread_mutex_unlock(&mutex_writer);
+    }
+
+    int clientCount() {
+        pthread_mutex_lock(&mutex_client);
+        int n = (int)clients.size();
+        pthread_mutex_unlock(&mutex_client);
+        return n;
     }
 
 private:

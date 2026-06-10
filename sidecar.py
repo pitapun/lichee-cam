@@ -8,7 +8,7 @@ NintiDetect sidecar
   - Serves web UI on port 7778  (MJPEG still direct from :7777)
 """
 
-import json, os, subprocess, threading, time, socket, sys, io
+import json, os, shutil, subprocess, threading, time, socket, sys, io
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from queue import Queue, Empty
@@ -17,7 +17,7 @@ import http.client
 # ---- Paths / ports ----
 CONFIG_FILE = os.environ.get('NINTI_CONFIG', '/root/ninti_config.json')
 STREAM_BIN  = os.environ.get('STREAM_BIN',  '/root/stream_yolo')
-MODEL       = os.environ.get('MODEL',        '/root/yolov5_cv181x.cvimodel')
+MODEL       = os.environ.get('MODEL',        '/root/yolov8n_coco80.cvimodel')
 RTSP_INITD  = '/etc/init.d/S99gc4653rtsp'
 LD_PATH     = '/mnt/system/usr/lib:/usr/bin/lib:/root/libs_patch'
 UDP_PORT    = 5005
@@ -25,6 +25,11 @@ HTTP_PORT   = 7778
 MJPEG_PORT  = 7777
 EVENT_DIR   = os.environ.get('NINTI_EVENT_DIR', '/root/ninti_events')
 EVENT_FILE  = os.path.join(EVENT_DIR, 'events.jsonl')
+EVENT_VIDEO_FPS = 25.0
+EVENT_STORAGE_MAX_USED_PCT = 80.0
+EVENT_STORAGE_TARGET_USED_PCT = 75.0
+EVENT_STORAGE_CHECK_SEC = 300
+HD_RECORD_CONTROL_FILE = '/tmp/ninti_hd_record_dir'
 
 DEFAULT_CONFIG = {
     'mode': 'ninti',
@@ -33,7 +38,25 @@ DEFAULT_CONFIG = {
     'filter_classes': ['person', 'vehicle', 'animal'],
     'motion_enabled': True,
     'motion_sensitivity': 20,
+    # Detection zones fed to YOLO: list of {"x":int,"y":int,"size":int}.
+    # size defaults to 640 (= model input); larger sizes capture a wider region
+    # and are downscaled in stream_yolo before feeding the detector.
+    # Max 4. Empty -> stream_yolo picks single center zone.
+    'detection_zones': [],
+    # When True, zone 0 becomes the "active follower": it re-centers each
+    # frame on the previous frame's motion centroid (clamped to the frame).
+    # UI renders this zone in orange instead of yellow.
+    'active_detector': False,
+    # Sensor resolution. Supported by gc4653 driver: 1280x720, 1920x1080, 2560x1440.
+    'sensor_width':  1280,
+    'sensor_height': 720,
+    # Frame-rate cap for stream_yolo main loop. Lower = less CPU = cooler SoC.
+    # 0 means uncapped (sensor max ~30fps).
+    'target_fps': 15,
 }
+INFER_SIZE = 640
+MAX_ZONES  = 4
+SENSOR_RES_OPTIONS = [(1280, 720), (1920, 1080), (2560, 1440)]
 
 # ---- State ----
 config_lock  = threading.Lock()
@@ -44,6 +67,12 @@ mode_lock    = threading.Lock()
 tracks_lock  = threading.Lock()
 tracks       = {}
 next_track_id = 1
+recorders_lock = threading.Lock()
+event_recorders = {}
+stream_lock = threading.Condition()
+latest_stream_jpg = None
+latest_stream_id = 0
+stream_clients = 0
 
 TRACK_IOU_THRESHOLD = 0.20
 TRACK_CENTER_THRESHOLD = 0.25
@@ -120,10 +149,310 @@ def _write_event(kind, tr, now):
             'bbox': tr.get('bbox'),
             't': now,
         }
+        if tr.get('video_url'):
+            rec['video_url'] = tr.get('video_url')
+        if tr.get('thumbnail_url'):
+            rec['thumbnail_url'] = tr.get('thumbnail_url')
+        if tr.get('event_dir'):
+            rec['event_dir'] = tr.get('event_dir')
+        if tr.get('event_meta_url'):
+            rec['event_meta_url'] = tr.get('event_meta_url')
+        if tr.get('frames_url'):
+            rec['frames_url'] = tr.get('frames_url')
+        if tr.get('num_frames') is not None:
+            rec['num_frames'] = tr.get('num_frames')
+        if tr.get('record_fps') is not None:
+            rec['record_fps'] = tr.get('record_fps')
         with open(EVENT_FILE, 'a') as f:
             f.write(json.dumps(rec, separators=(',', ':')) + '\n')
     except Exception as e:
         print(f'[events] write error: {e}')
+
+def _has_event_recorders():
+    with recorders_lock:
+        return bool(event_recorders)
+
+def _start_event_video(tr, now):
+    tid = tr['id']
+    _cleanup_event_storage()
+    with recorders_lock:
+        if tid in event_recorders:
+            return
+        _stop_hls_ffmpeg()
+        os.makedirs(EVENT_DIR, exist_ok=True)
+        stamp = int(now)
+        tmp_dir = os.path.join(EVENT_DIR, f'.track_{tid:05d}_recording_{stamp}')
+        frames_dir = os.path.join(tmp_dir, 'frames')
+        os.makedirs(frames_dir, exist_ok=True)
+        actual_fps = float(cfg.get('target_fps') or EVENT_VIDEO_FPS)
+        event_recorders[tid] = {
+            'track_id': tid,
+            'tmp_dir': tmp_dir,
+            'frames_dir': frames_dir,
+            'last_frame_t': now - (1.0 / actual_fps),
+            'frame_count': 0,
+            'fps': actual_fps,
+            'started_at': now,
+        }
+        try:
+            with open(HD_RECORD_CONTROL_FILE, 'w') as f:
+                f.write(frames_dir)
+        except Exception as e:
+            print(f'[events] hd control write error: {e}', flush=True)
+    print(f'[events] recording start track {tid}', flush=True)
+
+def _record_event_frame(jpg, now):
+    if os.path.exists(HD_RECORD_CONTROL_FILE):
+        return
+    writes = []
+    with recorders_lock:
+        for rec in event_recorders.values():
+            interval = 1.0 / rec['fps']
+            catchup = 0
+            while now - rec['last_frame_t'] >= interval and catchup < 16:
+                idx = rec['frame_count']
+                rec['frame_count'] += 1
+                rec['last_frame_t'] += interval
+                writes.append(os.path.join(rec['frames_dir'], f'frame_{idx:05d}.jpg'))
+                catchup += 1
+    for path in writes:
+        try:
+            with open(path, 'wb') as f:
+                f.write(jpg)
+        except Exception as e:
+            print(f'[events] frame write error: {e}', flush=True)
+
+def _record_event_frames_from_buffer(buf):
+    while True:
+        s = buf.find(b'\xff\xd8')
+        if s < 0:
+            return b''
+        e = buf.find(b'\xff\xd9', s + 2)
+        if e < 0:
+            return buf[s:]
+        jpg = buf[s:e + 2]
+        buf = buf[e + 2:]
+        _record_event_frame(jpg, time.time())
+
+def _publish_stream_frame(jpg):
+    global latest_stream_jpg, latest_stream_id
+    with stream_lock:
+        latest_stream_jpg = jpg
+        latest_stream_id += 1
+        stream_lock.notify_all()
+
+def _stream_interest():
+    with stream_lock:
+        clients = stream_clients
+    if clients > 0:
+        return True
+    return _has_event_recorders() and not os.path.exists(HD_RECORD_CONTROL_FILE)
+
+def _disk_used_pct(path):
+    os.makedirs(path, exist_ok=True)
+    usage = shutil.disk_usage(path)
+    return (usage.used / max(1, usage.total)) * 100.0
+
+def _valid_event_video_url(url):
+    if not url or not str(url).startswith('/event-video/'):
+        return False
+    rel = os.path.normpath(str(url)[len('/event-video/'):]).lstrip('/')
+    full = os.path.abspath(os.path.join(EVENT_DIR, rel))
+    root = os.path.abspath(EVENT_DIR)
+    return full.startswith(root + os.sep) and os.path.exists(full)
+
+def _rewrite_event_index_without_deleted_videos():
+    if not os.path.exists(EVENT_FILE):
+        return
+    kept = []
+    try:
+        with open(EVENT_FILE) as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except Exception:
+                    continue
+                if rec.get('video_url') and not _valid_event_video_url(rec.get('video_url')):
+                    continue
+                kept.append(json.dumps(rec, separators=(',', ':')))
+        tmp = EVENT_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            if kept:
+                f.write('\n'.join(kept) + '\n')
+        os.replace(tmp, EVENT_FILE)
+    except Exception as e:
+        print(f'[storage] index rewrite error: {e}', flush=True)
+
+def _cleanup_event_storage():
+    try:
+        os.makedirs(EVENT_DIR, exist_ok=True)
+        now = time.time()
+        for name in os.listdir(EVENT_DIR):
+            if not name.startswith('.track_') or '_recording_' not in name:
+                continue
+            path = os.path.join(EVENT_DIR, name)
+            try:
+                if os.path.isdir(path) and now - os.path.getmtime(path) > 3600:
+                    shutil.rmtree(path)
+                    print(f'[storage] removed stale temp {path}', flush=True)
+            except Exception:
+                pass
+
+        used = _disk_used_pct(EVENT_DIR)
+        if used < EVENT_STORAGE_MAX_USED_PCT:
+            return
+
+        event_dirs = []
+        for name in os.listdir(EVENT_DIR):
+            if not (name.startswith('event_') and '_save_' in name):
+                continue
+            path = os.path.join(EVENT_DIR, name)
+            if os.path.isdir(path):
+                event_dirs.append((os.path.getmtime(path), path))
+        event_dirs.sort()
+        deleted = 0
+        for _mtime, path in event_dirs:
+            if _disk_used_pct(EVENT_DIR) <= EVENT_STORAGE_TARGET_USED_PCT:
+                break
+            shutil.rmtree(path)
+            deleted += 1
+            print(f'[storage] deleted old event {path}', flush=True)
+        if deleted:
+            _rewrite_event_index_without_deleted_videos()
+            print(f'[storage] cleanup done used={_disk_used_pct(EVENT_DIR):.1f}%', flush=True)
+    except Exception as e:
+        print(f'[storage] cleanup error: {e}', flush=True)
+
+def _storage_cleanup_loop():
+    while True:
+        _cleanup_event_storage()
+        time.sleep(EVENT_STORAGE_CHECK_SEC)
+
+def _run_ffmpeg(frames_dir, out_mp4, fps, h264_in=None):
+    rfps = str(int(fps)) if fps == int(fps) else str(fps)
+    if h264_in and os.path.exists(h264_in):
+        cmds = [
+            ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
+             '-r', rfps, '-i', h264_in, '-c:v', 'copy',
+             '-metadata:s:v:0', 'rotate=180', out_mp4],
+            ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
+             '-r', rfps, '-i', h264_in, '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p',
+             '-metadata:s:v:0', 'rotate=180', out_mp4],
+        ]
+        for cmd in cmds:
+            try:
+                subprocess.check_call(cmd)
+                return os.path.exists(out_mp4)
+            except Exception:
+                pass
+    pattern = os.path.join(frames_dir, 'frame_%05d.jpg')
+    cmds = [
+        ['ffmpeg', '-y', '-loglevel', 'error', '-framerate', str(fps),
+         '-i', pattern, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', out_mp4],
+        ['ffmpeg', '-y', '-loglevel', 'error', '-framerate', str(fps),
+         '-i', pattern, '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p', out_mp4],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.check_call(cmd)
+            return os.path.exists(out_mp4)
+        except Exception:
+            pass
+    return False
+
+def _wait_hd_record_done(frames_dir, timeout=15.0):
+    done = os.path.join(frames_dir, '.hd_done')
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(done):
+            return True
+        time.sleep(0.1)
+    return False
+
+def _finish_event_video(tr, save, now):
+    tid = tr['id']
+    with recorders_lock:
+        rec = event_recorders.pop(tid, None)
+    if not rec:
+        return None
+    try:
+        if os.path.exists(HD_RECORD_CONTROL_FILE):
+            with open(HD_RECORD_CONTROL_FILE) as f:
+                active_dir = f.read().strip()
+            if active_dir == rec.get('frames_dir'):
+                os.unlink(HD_RECORD_CONTROL_FILE)
+                _wait_hd_record_done(rec.get('frames_dir'))
+                if HLS_ENABLED:
+                    threading.Thread(target=_start_hls_ffmpeg, daemon=True).start()
+    except Exception:
+        pass
+    tmp_dir = rec['tmp_dir']
+    if not save:
+        try:
+            subprocess.call(['rm', '-rf', tmp_dir])
+        except Exception:
+            pass
+        print(f'[events] recording discarded track {tid}', flush=True)
+        return None
+
+    try:
+        actual_frames = [p for p in os.listdir(rec['frames_dir'])
+                         if p.startswith('frame_') and p.endswith('.jpg')]
+    except Exception:
+        actual_frames = []
+    h264_tmp = os.path.join(tmp_dir, 'event.h264')
+    if not actual_frames and not os.path.exists(h264_tmp):
+        subprocess.call(['rm', '-rf', tmp_dir])
+        return None
+
+    stamp = int(now)
+    event_name = f'event_{tid:05d}_save_{stamp}'
+    event_dir = os.path.join(EVENT_DIR, event_name)
+    if os.path.exists(event_dir):
+        subprocess.call(['rm', '-rf', event_dir])
+    os.rename(tmp_dir, event_dir)
+    frames_dir = os.path.join(event_dir, 'frames')
+    h264_in = os.path.join(event_dir, 'event.h264')
+    frame_files = sorted([p for p in os.listdir(frames_dir) if p.endswith('.jpg')])
+    thumb_ok = False
+    if frame_files:
+        best = os.path.join(frames_dir, frame_files[len(frame_files)//2])
+        thumb_ok = subprocess.call(['cp', best, os.path.join(event_dir, 'best_frame.jpg')]) == 0
+    out_mp4 = os.path.join(event_dir, 'event.mp4')
+    ok = _run_ffmpeg(frames_dir, out_mp4, rec['fps'], h264_in)
+    if ok and not thumb_ok:
+        thumb_ok = subprocess.call([
+            'ffmpeg', '-y', '-loglevel', 'error', '-i', out_mp4,
+            '-frames:v', '1', os.path.join(event_dir, 'best_frame.jpg')
+        ]) == 0
+    event_url = f'/event-video/{event_name}'
+    meta = {
+        'track_id': tid,
+        'cat': tr.get('cat'),
+        'cls': tr.get('cls'),
+        'name': tr.get('name'),
+        'first_seen': tr.get('first_seen'),
+        'last_seen': tr.get('last_seen'),
+        'duration_s': round(now - tr.get('first_seen', now), 3),
+        'hits': tr.get('hits', 0),
+        'best_score': tr.get('best_score', 0),
+        'record_fps': rec['fps'],
+        'num_frames': len(frame_files),
+        'video_ok': ok,
+        'event_dir': event_url,
+        'event_meta_url': f'{event_url}/event.json',
+        'frames_url': f'{event_url}/frames/',
+        'video_url': f'{event_url}/event.mp4' if ok else None,
+        'thumbnail_url': f'{event_url}/best_frame.jpg' if thumb_ok else None,
+    }
+    with open(os.path.join(event_dir, 'event.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f'[events] recording saved track {tid} -> {event_dir}', flush=True)
+    _cleanup_event_storage()
+    return meta
 
 def _expire_tracks(now=None):
     if now is None:
@@ -134,20 +463,33 @@ def _expire_tracks(now=None):
             lost  = now - tr.get('last_seen',  now) > TRACK_LOST_TIMEOUT
             still = now - tr.get('last_moved', now) > TRACK_STILL_TIMEOUT
             if lost or still:
-                if tr.get('confirmed'):
-                    _write_event('end', tr, now)
                 expired.append(tid)
         for tid in expired:
             tr = tracks.pop(tid, {})
-            if tr.get('hits', 0) >= 1:
-                # any tracked object gets saved
-                if not tr.get('confirmed'):
-                    _write_event('end', tr, now)  # write end event if start wasn't written
+            duration = now - tr.get('first_seen', now)
+            fps = float(cfg.get('target_fps') or EVENT_VIDEO_FPS)
+            min_dur = 2.0 / fps  # discard if shorter than 2 frames
+            if tr.get('confirmed') and duration >= min_dur:
+                # only write events for confirmed tracks with sufficient duration
+                video_meta = _finish_event_video(tr, True, now)
+                if video_meta:
+                    tr['video_url'] = video_meta.get('video_url')
+                    tr['thumbnail_url'] = video_meta.get('thumbnail_url')
+                    tr['event_dir'] = video_meta.get('event_dir')
+                    tr['event_meta_url'] = video_meta.get('event_meta_url')
+                    tr['frames_url'] = video_meta.get('frames_url')
+                    tr['num_frames'] = video_meta.get('num_frames')
+                    tr['record_fps'] = video_meta.get('record_fps')
+                _write_event('end', tr, now)
                 msg = 'data: ' + json.dumps({'_save': True, 'track_id': tid,
                                               'name': tr.get('name', '?'),
                                               'hits': tr.get('hits', 0),
-                                              'duration_s': round(now - tr.get('first_seen', now), 1)}) + '\n\n'
+                                              'duration_s': round(duration, 1),
+                                              'video_url': tr.get('video_url'),
+                                              'thumbnail_url': tr.get('thumbnail_url'),
+                                              'event_meta_url': tr.get('event_meta_url')}) + '\n\n'
             else:
+                _finish_event_video(tr, False, now)
                 msg = 'data: ' + json.dumps({'_discard': True, 'track_id': tid,
                                               'name': tr.get('name', '?'),
                                               'hits': tr.get('hits', 0)}) + '\n\n'
@@ -205,7 +547,7 @@ def _update_track(det):
         tr['best_score'] = max(float(tr.get('best_score', 0.0)), float(det.get('score', 0.0)))
         if not tr.get('confirmed') and tr['hits'] >= TRACK_CONFIRM_HITS:
             tr['confirmed'] = True
-            _write_event('start', tr, now)
+            _start_event_video(tr, now)
 
         det['track_id'] = best_id
         det['track_hits'] = tr['hits']
@@ -236,6 +578,49 @@ def _stop_rtsp():
     time.sleep(1)
     print('[rtsp] stopped')
 
+# ---- HLS ffmpeg lifecycle ----
+HLS_FIFO = '/tmp/hls_feed.h264'
+HLS_DIR  = '/tmp/hls'
+HLS_ENABLED = False
+_hls_proc = None
+_hls_lock = threading.Lock()
+
+def _start_hls_ffmpeg():
+    global _hls_proc
+    if not HLS_ENABLED:
+        return
+    os.makedirs(HLS_DIR, exist_ok=True)
+    if not os.path.exists(HLS_FIFO):
+        os.mkfifo(HLS_FIFO)
+    time.sleep(4)  # wait for stream_yolo to open the FIFO (O_RDWR)
+    with _hls_lock:
+        if _hls_proc and _hls_proc.poll() is None:
+            return
+        _hls_proc = subprocess.Popen([
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-f', 'h264', '-r', '25', '-i', HLS_FIFO,
+            '-c:v', 'copy',
+            '-f', 'hls',
+            '-hls_time', '2',
+            '-hls_list_size', '5',
+            '-hls_flags', 'delete_segments+append_list+omit_endlist',
+            f'{HLS_DIR}/live.m3u8',
+        ], stdout=subprocess.DEVNULL, stderr=open('/tmp/hls_ffmpeg.log', 'w'))
+        print(f'[hls] ffmpeg started pid={_hls_proc.pid}')
+
+def _stop_hls_ffmpeg():
+    global _hls_proc
+    with _hls_lock:
+        if _hls_proc:
+            _hls_proc.terminate()
+            try: _hls_proc.wait(5)
+            except: _hls_proc.kill()
+            _hls_proc = None
+    for f in os.listdir(HLS_DIR) if os.path.isdir(HLS_DIR) else []:
+        try: os.remove(os.path.join(HLS_DIR, f))
+        except: pass
+    print('[hls] ffmpeg stopped')
+
 # ---- stream_yolo lifecycle ----
 def _yolo_running():
     with yolo_lock:
@@ -250,18 +635,67 @@ def _start_yolo_inner():
             except: yolo_proc.kill()
         env = os.environ.copy()
         env['LD_LIBRARY_PATH'] = LD_PATH
+        # GC4653 sensor floor is ~2.75fps; clamp at 3 even if user picks lower
+        # (target_frame_us sleep in main.cpp still honours the user value).
+        _tfps_env = int(cfg.get('target_fps', 0) or 0)
+        if _tfps_env > 0:
+            env['YOLO_CAP_FPS'] = str(max(3, min(30, _tfps_env)))
+        # Sensor driver selection. Default = GC4653; set sensor_driver: "OS04A10"
+        # in config on boards where GC4653 driver causes VI permission errors.
+        if cfg.get('sensor_driver'):
+            env['YOLO_SNS'] = str(cfg['sensor_driver'])
         thresh = str(cfg.get('threshold', 0.45))
-        print(f'[yolo] starting with threshold={thresh}')
+        sw = int(cfg.get('sensor_width',  1280))
+        sh = int(cfg.get('sensor_height', 720))
+        if (sw, sh) not in SENSOR_RES_OPTIONS:
+            sw, sh = 1280, 720
+        # Build --zones "x,y;x,y;..." (clamped to frame). Empty list -> auto-
+        # populate a single center zone and persist, so the UI yellow box
+        # matches what stream_yolo actually crops.
+        raw_zones = cfg.get('detection_zones', []) or []
+        if not raw_zones:
+            raw_zones = [{'x': max(0, (sw - INFER_SIZE)//2),
+                          'y': max(0, (sh - INFER_SIZE)//2),
+                          'size': INFER_SIZE}]
+            with config_lock:
+                cfg['detection_zones'] = raw_zones
+            save_cfg()
+        clamped = []
+        for z in raw_zones[:MAX_ZONES]:
+            try:
+                x = int(z.get('x', 0)); y = int(z.get('y', 0))
+                size = int(z.get('size', INFER_SIZE))
+            except Exception:
+                continue
+            size = max(INFER_SIZE, min(size, min(sw, sh)))
+            x = max(0, min(x, sw - size))
+            y = max(0, min(y, sh - size))
+            clamped.append((x, y, size))
+        args = [STREAM_BIN, MODEL, '80', str(INFER_SIZE), thresh,
+                str(UDP_PORT), str(sw), str(sh)]
+        if clamped:
+            args += ['--zones', ';'.join(f'{x},{y},{s}' for x, y, s in clamped)]
+        if cfg.get('active_detector', False):
+            args += ['--active-detector']
+        tfps = int(cfg.get('target_fps', 0) or 0)
+        if tfps > 0:
+            args += ['--fps', str(tfps)]
+        msen = float(cfg.get('motion_sensitivity', 20))
+        args += ['--motion-thresh', f'{msen / 5.0:.2f}']
+        print(f'[yolo] starting threshold={thresh} sensor={sw}x{sh} '
+              f'zones={clamped} active={cfg.get("active_detector",False)} '
+              f'fps_cap={tfps or "off"}')
         yolo_log = open('/tmp/stream_yolo.log', 'w')
-        yolo_proc = subprocess.Popen(
-            [STREAM_BIN, MODEL, '80', '640', thresh, str(UDP_PORT), '1280', '720'],
-            env=env, stdout=yolo_log, stderr=yolo_log)
+        yolo_proc = subprocess.Popen(args, env=env, stdout=yolo_log, stderr=yolo_log)
+        if HLS_ENABLED:
+            threading.Thread(target=_start_hls_ffmpeg, daemon=True).start()
 
 def start_yolo():
     threading.Thread(target=_start_yolo_inner, daemon=True).start()
 
 def stop_yolo():
     global yolo_proc
+    _stop_hls_ffmpeg()
     with yolo_lock:
         if yolo_proc:
             yolo_proc.terminate()
@@ -316,12 +750,23 @@ def _motion_detector():
     last_fire  = 0.0
     last_check = 0.0
     while True:
+        # Only connect MJPEG when an external client is actually watching the SSE
+        # stream - otherwise the connection forces stream_yolo to encode JPEG
+        # every frame (~400ms on cv181x). Idle: poll once a second.
+        if not _stream_interest():
+            prev_gray = None
+            time.sleep(1)
+            continue
         try:
             conn = _hc.HTTPConnection('127.0.0.1', MJPEG_PORT, timeout=5)
             conn.request('GET', '/')
             resp = conn.getresponse()
             buf = b''
             while True:
+                if not _stream_interest():
+                    try: conn.close()
+                    except: pass
+                    break
                 chunk = resp.read(4096)
                 if not chunk:
                     break
@@ -339,6 +784,9 @@ def _motion_detector():
                     jpg = buf[s:e + 2]
                     buf = buf[e + 2:]
                     try:
+                        now_t = time.time()
+                        _publish_stream_frame(jpg)
+                        _record_event_frame(jpg, now_t)
                         with config_lock:
                             motion_on  = cfg.get('motion_enabled', True)
                             sensitivity = cfg.get('motion_sensitivity', MOTION_SENSITIVITY)
@@ -346,7 +794,6 @@ def _motion_detector():
                             prev_gray = None
                             continue
                         # Rate-limit: skip frames to avoid blocking the MJPEG write queue
-                        now_t = time.time()
                         if now_t - last_check < MOTION_CHECK_INTERVAL:
                             continue
                         last_check = now_t
@@ -403,7 +850,7 @@ def udp_listener():
             continue
         try:
             det = json.loads(data)
-            if '_fps' in det:
+            if '_fps' in det or '_active_zone' in det:
                 msg = 'data: ' + json.dumps(det) + '\n\n'
                 for q in list(sse_clients):
                     try: q.put_nowait(msg)
@@ -432,14 +879,42 @@ HTML = b'''<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NintiDetect</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:monospace;background:#111;color:#eee;display:flex;height:100vh;overflow:hidden}
-#state{width:160px;padding:12px 10px;background:#141414;display:flex;flex-direction:column;gap:0;font-size:12px;border-right:1px solid #2a2a2a;overflow-y:auto}
-#state h2{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:3px;margin-bottom:10px;letter-spacing:.05em}
+body{font-family:monospace;background:#111;color:#eee;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+/* top nav */
+#topnav{display:flex;align-items:center;height:46px;background:#141414;border-bottom:1px solid #2a2a2a;padding:0 16px;flex:0 0 auto;gap:0}
+#nav-brand{font-size:12px;letter-spacing:.12em;color:#8cf;font-weight:bold;margin-right:28px;user-select:none}
+#nav-tabs{display:flex;height:100%}
+.nav-tab{padding:0 22px;height:100%;background:transparent;border:0;border-bottom:3px solid transparent;font-family:monospace;font-size:11px;letter-spacing:.08em;color:#555;cursor:pointer;text-transform:uppercase;transition:color .12s;white-space:nowrap}
+.nav-tab:hover{color:#aaa}
+.nav-tab.active{color:#8cf;border-bottom-color:#8cf}
+#nav-status{margin-left:auto;font-size:11px;color:#555;display:flex;align-items:center;gap:10px}
+#status{color:#8cf;font-size:11px}
+
+/* main tab pages */
+.main-tab{display:none;flex:1;min-height:0;overflow:hidden}
+.main-tab.active{display:flex}
+
+/* live tab */
+#zone-panel{width:200px;flex:0 0 200px;padding:10px;background:#141414;display:flex;flex-direction:column;border-left:1px solid #2a2a2a;overflow-y:auto;font-size:12px;gap:10px}
+#zone-panel .panel-head{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:4px;margin-bottom:6px;letter-spacing:.1em;text-transform:uppercase}
+.zp-section{display:flex;flex-direction:column;gap:4px}
+.zp-section h3{font-size:10px;color:#555;letter-spacing:.08em;text-transform:uppercase;margin-bottom:2px}
+#pipeline-panel{width:176px;flex:0 0 176px;padding:12px 10px;background:#141414;display:flex;flex-direction:column;border-right:1px solid #2a2a2a;overflow-y:auto;font-size:12px}
+.panel-head{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:4px;margin-bottom:10px;letter-spacing:.1em;text-transform:uppercase}
+#stream-area{flex:1;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}
+#stream{display:block;width:100%;height:100%;object-fit:contain;image-rendering:pixelated}
+#hlsPlayer{display:none;width:100%;transform:rotate(180deg)}
+#overlay{position:absolute;cursor:crosshair}
+#stream-btns{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);display:flex;gap:6px}
+
+/* pipeline */
 .pipeline{display:flex;flex-direction:column;align-items:stretch;gap:0}
-.pnode{border:1px solid #2a2a2a;border-radius:5px;padding:7px 10px;background:#1a1a1a;transition:background .15s,border-color .15s,color .15s;cursor:default;position:relative}
+.pnode{border:1px solid #2a2a2a;padding:7px 10px;background:#1a1a1a;transition:background .15s,border-color .15s;cursor:default}
 .pnode .pname{font-size:11px;font-weight:bold;color:#555;letter-spacing:.03em;transition:color .15s}
 .pnode .pinfo{font-size:10px;color:#444;margin-top:2px;min-height:12px;transition:color .15s}
 .pnode.active{background:#0d2a0d;border-color:#2a6a2a}
@@ -452,34 +927,71 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;height:100vh;
 .parrow{text-align:center;color:#333;font-size:14px;line-height:1;margin:2px 0;user-select:none}
 .parrow.active{color:#2a6a2a}
 .pardiv{display:flex;justify-content:space-around;color:#333;font-size:11px;line-height:1;margin:2px 0}
-.pstat{margin-top:14px;border-top:1px solid #222;padding-top:8px;display:flex;flex-direction:column;gap:5px}
+.pstat{margin-top:14px;border-top:1px solid #222;padding-top:10px;display:flex;flex-direction:column;gap:6px}
 .st-row{display:flex;flex-direction:column;gap:1px}
 .st-label{font-size:10px;color:#555}
-.st-val{font-size:12px;color:#ccc}
+.st-val{font-size:13px;color:#ccc}
 .st-val.on{color:#0f0}
 .st-val.off{color:#555}
 .st-val.warn{color:#fa5}
-#left{flex:1;position:relative;display:flex;align-items:center;justify-content:center;background:#000}
-#stream{display:block;max-width:100%;max-height:100%;image-rendering:pixelated}
-#overlay{position:absolute;cursor:crosshair}
-#right{width:300px;padding:10px;overflow-y:auto;background:#1a1a1a;display:flex;flex-direction:column;gap:8px;font-size:12px}
-h2{font-size:11px;color:#888;border-bottom:1px solid #333;padding-bottom:3px;margin-bottom:2px}
+
+/* events tab */
+#main-events{overflow-y:auto;display:none}
+#main-events.active{display:block}
+#ev-toolbar{position:sticky;top:0;z-index:2;background:#0e0e0e;border-bottom:1px solid #2a2a2a;padding:8px 16px;display:flex;align-items:center;gap:10px}
+.ev-title{font-size:10px;color:#555;letter-spacing:.1em;text-transform:uppercase;flex:1}
+.ev-count{font-size:11px;color:#555}
+#eventsLeft{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:2px;padding:2px;background:#0a0a0a}
+.ev-mini{display:flex;flex-direction:column;cursor:pointer;overflow:hidden;background:#141414;transition:opacity .15s}
+.ev-mini:hover{opacity:.8}
+.ev-mini .ev-thumb-wrap{aspect-ratio:16/9;overflow:hidden;background:#000}
+.ev-mini .ev-thumb-wrap img{width:100%;height:100%;object-fit:cover;display:block}
+.ev-mini .ev-thumb-wrap .ev-no-thumb{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:22px;color:#333}
+.ev-mini .ev-info{padding:6px 8px;flex:0 0 auto}
+.ev-mini .ev-head{display:flex;align-items:center;gap:5px;margin-bottom:2px}
+.ev-mini .ev-cat{font-size:10px;color:#8cf;font-weight:bold;text-transform:uppercase;letter-spacing:.05em;flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.ev-mini .ev-score{font-size:10px;color:#8f8;flex:0 0 auto}
+.ev-mini .muted{font-size:10px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ev-mini .ev-dur{font-size:10px;color:#555}
+.thumb{display:none}
+.ev-noresult{grid-column:1/-1;padding:40px 20px;color:#555;font-size:12px;text-align:center}
+/* lightbox */
+#ev-lightbox{display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.92);flex-direction:column;align-items:center;justify-content:center}
+#ev-lightbox.open{display:flex}
+#ev-lb-close{position:absolute;top:14px;right:18px;font-size:22px;color:#888;cursor:pointer;line-height:1;background:none;border:none;padding:4px 8px}
+#ev-lb-close:hover{color:#fff}
+#ev-lb-inner{position:relative;max-width:90vw;max-height:82vh;display:flex;align-items:center;justify-content:center}
+#eventPlayer{max-width:90vw;max-height:78vh;background:#000;display:none}
+#eventFramePlayer{max-width:90vw;max-height:78vh;object-fit:contain;background:#000;display:none}
+#ev-meta{margin-top:10px;font-size:11px;color:#666;text-align:center;line-height:1.8}
+
+/* detection-zone preview in settings */
+/* settings tab */
+#main-settings{overflow-y:auto;display:none}
+#main-settings.active{display:block}
+#settings-inner{max-width:560px;margin:0 auto;padding:20px 16px;display:flex;flex-direction:column;gap:14px}
+.s-section{background:#141414;border:1px solid #2a2a2a;padding:14px 16px}
+.s-section h2{font-size:10px;color:#666;border-bottom:1px solid #222;padding-bottom:5px;margin-bottom:10px;letter-spacing:.1em;text-transform:uppercase}
+.s-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.s-row:last-child{margin-bottom:0}
+.s-label{font-size:11px;color:#666;min-width:80px}
+
+/* common */
 input[type=range]{width:100%}
-input[type=text]{background:#222;color:#eee;border:1px solid #555;padding:3px 5px;font-family:monospace;font-size:12px}
-button{background:#2a2a2a;color:#ddd;border:1px solid #555;padding:4px 9px;cursor:pointer;font-family:monospace;font-size:12px}
+input[type=text],select{background:#222;color:#eee;border:1px solid #555;padding:4px 6px;font-family:monospace;font-size:12px}
+button{background:#2a2a2a;color:#ddd;border:1px solid #555;padding:5px 10px;cursor:pointer;font-family:monospace;font-size:12px}
 button:hover{background:#3a3a3a}
 button.red{border-color:#633;color:#f88}
+button.red:hover{background:#2a1010}
 button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
 .row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-#log,#events{height:120px;overflow-y:auto;background:#0a0a0a;padding:5px;border:1px solid #2a2a2a}
-.ll{color:#0f0;padding:1px 0}
-.ev{color:#8cf;padding:1px 0}
-#status{font-size:11px;color:#666;min-height:16px}
-.zi{background:#1e1e1e;border:1px solid #3a3a3a;padding:5px;border-radius:3px;margin-bottom:4px}
+#log{height:200px;overflow-y:auto;background:#0a0a0a;padding:6px;border:1px solid #2a2a2a;line-height:1.5}
+.ll{color:#0f0;padding:1px 0;font-size:12px}
+.hint{color:#555;font-size:11px}
+.zi{background:#1e1e1e;border:1px solid #333;padding:5px;margin-bottom:4px}
 .zn{font-weight:bold}
-.hint{color:#666;font-size:11px}
-.mode-radio{display:flex;gap:10px}
-.mode-radio label{display:flex;align-items:center;gap:4px;cursor:pointer;padding:4px 8px;border:1px solid #444;border-radius:3px}
+.mode-radio{display:flex;gap:10px;flex-wrap:wrap}
+.mode-radio label{display:flex;align-items:center;gap:4px;cursor:pointer;padding:5px 10px;border:1px solid #444}
 .mode-radio label.active{border-color:#4a8a4a;background:#1a3a1a;color:#8f8}
 .dot{width:7px;height:7px;border-radius:50%;background:#555;display:inline-block}
 .dot.on{background:#0f0}
@@ -487,145 +999,225 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
 </style>
 </head>
 <body>
-<div id="state">
-  <h2>PIPELINE</h2>
-  <div class="pipeline">
-    <div class="pnode" id="pn-motion">
-      <div class="pname">MOTION DETECT</div>
-      <div class="pinfo" id="pi-motion">-</div>
-    </div>
-    <div class="parrow" id="pa-motion">&#x25BC;</div>
-    <div class="pnode" id="pn-ai">
-      <div class="pname">AI DETECT</div>
-      <div class="pinfo" id="pi-ai">-</div>
-    </div>
-    <div class="parrow" id="pa-ai">&#x25BC;</div>
-    <div class="pnode" id="pn-track">
-      <div class="pname">AI TRACKING</div>
-      <div class="pinfo" id="pi-track">-</div>
-    </div>
-    <div class="pardiv" id="pa-track">
-      <span>&#x25C4; discard</span>
-      <span>save &#x25BA;</span>
-    </div>
-    <div style="display:flex;gap:6px">
-      <div class="pnode" id="pn-discard" style="flex:1">
-        <div class="pname">DISCARD</div>
-        <div class="pinfo" id="pi-discard"></div>
-      </div>
-      <div class="pnode" id="pn-save" style="flex:1">
-        <div class="pname">SAVE</div>
-        <div class="pinfo" id="pi-save"></div>
-      </div>
-    </div>
+
+<div id="topnav">
+  <span id="nav-brand">NINTIDETECT</span>
+  <div id="nav-tabs">
+    <button class="nav-tab active" onclick="showMainTab('live',this)">&#9654; Live</button>
+    <button class="nav-tab" onclick="showMainTab('events',this)">Events</button>
+    <button class="nav-tab" onclick="showMainTab('settings',this)">Settings</button>
   </div>
-  <div class="pstat">
-    <div class="st-row"><span class="st-label">mode</span><span class="st-val" id="stMode">-</span></div>
-    <div class="st-row"><span class="st-label">detector</span><span class="st-val off" id="stYolo">-</span></div>
-    <div class="st-row"><span class="st-label">tracks</span><span class="st-val" id="stTracks">0</span></div>
-    <div class="st-row"><span class="st-label">threshold</span><span class="st-val" id="stThresh">-</span></div>
-    <div class="st-row"><span class="st-label">fps</span><span class="st-val" id="stFps">-</span></div>
-    <div class="st-row"><span class="st-label">last det</span><span class="st-val" id="stLastDet" style="font-size:10px;line-height:1.4">-</span></div>
+  <div id="nav-status">
+    <span class="dot" id="dotYolo"></span><span id="stMode" style="margin-left:5px">-</span>
+    <span id="stTemp">-</span>
+    <span id="status"></span>
   </div>
 </div>
-<div id="left">
-  <img id="stream" src="" alt="stream offline">
-  <canvas id="overlay"></canvas>
-</div>
-<div id="right">
 
-<div>
-<h2>CONNECTION</h2>
-<div class="row">
-  <input id="ip" type="text" placeholder="board IP" style="flex:1" value="">
-  <button onclick="connect()">Connect</button>
-</div>
-<div id="status"></div>
-</div>
+<!-- -- Tab 1: Live -- -->
+<div class="main-tab active" id="main-live">
 
-<div>
-<h2>MODE</h2>
-<div class="mode-radio" id="modeRadio">
-  <label id="lbl_ninti"><input type="radio" name="mode" value="ninti" onchange="pendingMode='ninti';updateModeLabels()"> NintiDetect</label>
-  <label id="lbl_rtsp"><input type="radio" name="mode" value="rtsp" onchange="pendingMode='rtsp';updateModeLabels()"> RTSP</label>
-</div>
-<div class="row" style="margin-top:4px">
-  <button onclick="applyMode()" style="flex:1">Switch Mode</button>
-  <span class="hint" id="modeStatus"></span>
-</div>
-<div class="row hint" style="margin-top:2px">
-  <span class="dot" id="dotYolo"></span> detector
-  &nbsp;&nbsp;
-  <span class="dot" id="dotRtsp"></span> rtsp
-</div>
-</div>
+  <div id="pipeline-panel">
+    <div class="panel-head">Pipeline</div>
+    <div class="pipeline">
+      <div class="pnode" id="pn-motion">
+        <div class="pname">MOTION</div>
+        <div class="pinfo" id="pi-motion">-</div>
+      </div>
+      <div class="parrow" id="pa-motion">&#x25BC;</div>
+      <div class="pnode" id="pn-ai">
+        <div class="pname">AI DETECT</div>
+        <div class="pinfo" id="pi-ai">-</div>
+      </div>
+      <div class="parrow" id="pa-ai">&#x25BC;</div>
+      <div class="pnode" id="pn-track">
+        <div class="pname">TRACKING</div>
+        <div class="pinfo" id="pi-track">-</div>
+      </div>
+      <div class="pardiv" id="pa-track">
+        <span>&#x25C4; discard</span>
+        <span>save &#x25BA;</span>
+      </div>
+      <div style="display:flex;gap:6px">
+        <div class="pnode" id="pn-discard" style="flex:1">
+          <div class="pname">DISCARD</div>
+          <div class="pinfo" id="pi-discard"></div>
+        </div>
+        <div class="pnode" id="pn-save" style="flex:1">
+          <div class="pname">SAVE</div>
+          <div class="pinfo" id="pi-save"></div>
+        </div>
+      </div>
+    </div>
+    <div class="pstat">
+      <div class="st-row"><span class="st-label">detector</span><span class="st-val off" id="stYolo">-</span></div>
+      <div class="st-row"><span class="st-label">tracks</span><span class="st-val" id="stTracks">0</span></div>
+      <div class="st-row"><span class="st-label">threshold</span><span class="st-val" id="stThresh">-</span></div>
+      <div class="st-row"><span class="st-label">fps</span><span class="st-val" id="stFps">-</span></div>
+      <div class="st-row"><span class="st-label">last det</span><span class="st-val" id="stLastDet" style="font-size:10px;line-height:1.4">-</span></div>
+    </div>
+  </div>
 
-<div>
-<h2>THRESHOLD</h2>
-<div class="row">
-  <input type="range" id="th" min="0.05" max="0.95" step="0.05" value="0.45"
-         oninput="document.getElementById('thv').textContent=parseFloat(this.value).toFixed(2)">
-  <span id="thv" style="width:32px">0.45</span>
-</div>
-<button onclick="applyThresh()" style="margin-top:4px;width:100%">Apply &amp; restart detector</button>
-</div>
+  <div id="stream-area">
+    <img id="stream" src="" alt="stream offline">
+    <video id="hlsPlayer" muted autoplay playsinline></video>
+    <canvas id="overlay"></canvas>
+    <div id="stream-btns">
+      <button onclick="setStream('mjpeg')" id="btnMjpeg">MJPEG</button>
+    </div>
+  </div>
 
-<div>
-<h2>MOTION DETECT</h2>
-<div class="row" style="margin-bottom:4px">
-  <button id="btnMotion" onclick="toggleMotion()" style="flex:1">-</button>
-</div>
-<div class="row">
-  <span class="hint" style="width:60px">sensitivity</span>
-  <input type="range" id="mth" min="5" max="50" step="5" value="20" style="flex:1"
-         oninput="document.getElementById('mthv').textContent=this.value">
-  <span id="mthv" style="width:28px">20</span>
-</div>
-<button onclick="applyMotion()" style="margin-top:4px;width:100%">Apply</button>
-</div>
+  <div id="zone-panel">
+    <div class="zp-section">
+      <div class="panel-head">Detection Zones</div>
+      <button onclick="addDetZone()" style="width:100%">+ Add zone</button>
+      <button onclick="delLastDetZone()" class="red" style="width:100%">- Remove last</button>
+      <button id="activeBtn" onclick="toggleActiveDetector()" style="width:100%">Zone 1 follower: OFF</button>
+      <div class="hint" style="font-size:10px;color:#555;margin-top:2px">Follows detected target when ON</div>
+      <div id="dzlist" class="hint"></div>
+      <button onclick="applyAll()" class="act apply-all-btn" style="width:100%">Apply</button>
+    </div>
+    <div class="zp-section">
+      <div class="panel-head">Filter Zones</div>
+      <div style="display:flex;gap:4px">
+        <input id="zname" type="text" placeholder="zone name" style="flex:1;min-width:0">
+        <button onclick="newZone()">+</button>
+        <button onclick="cancelZone()" class="red">x</button>
+      </div>
+      <div id="zlist"></div>
+    </div>
+  </div>
 
-<div>
-<h2>ZONES <span class="hint">(click stream to draw)</span></h2>
-<div class="row" style="margin-bottom:4px">
-  <input id="zname" type="text" placeholder="zone name" style="flex:1">
-  <button onclick="newZone()">+ New</button>
-  <button onclick="cancelZone()" class="red">Cancel</button>
-</div>
-<div id="zlist"></div>
-</div>
-
-<div>
-<h2>FILTER CLASSES</h2>
-<div id="fclasses"></div>
-</div>
-
-<button onclick="saveConf()" style="width:100%;padding:6px">Save Config</button>
-
-<div>
-<h2>DETECTIONS</h2>
-<div id="log"></div>
-</div>
-
-<div>
-<h2>RECENT EVENTS</h2>
-<div class="row" style="margin-bottom:4px">
-  <button onclick="loadEvents()" style="flex:1">Refresh</button>
-  <span class="hint" id="eventStatus"></span>
-</div>
-<div id="events"></div>
 </div>
 
+<!-- -- Tab 2: Events -- -->
+<div class="main-tab" id="main-events">
+  <div id="ev-toolbar">
+    <span class="ev-title">Events</span>
+    <span class="ev-count" id="eventStatusLeft"></span>
+    <button onclick="loadEvents()" style="font-size:10px;padding:2px 8px">Refresh</button>
+  </div>
+  <div id="eventsLeft"><div class="ev-noresult">No events yet</div></div>
+</div>
+
+<!-- lightbox -->
+<div id="ev-lightbox">
+  <button id="ev-lb-close" onclick="closeLightbox()">x</button>
+  <div id="ev-lb-inner">
+    <video id="eventPlayer" controls muted playsinline></video>
+    <img id="eventFramePlayer" alt="">
+  </div>
+  <div id="ev-meta"></div>
+</div>
+
+<!-- -- Tab 3: Settings -- -->
+<div class="main-tab" id="main-settings">
+<div id="settings-inner">
+
+  <div class="s-section">
+    <h2>Connection</h2>
+    <div class="s-row">
+      <input id="ip" type="text" placeholder="board IP" style="flex:1" value="">
+      <button onclick="connect()">Connect</button>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Mode</h2>
+    <div class="mode-radio" id="modeRadio">
+      <label id="lbl_ninti"><input type="radio" name="mode" value="ninti" onchange="pendingMode='ninti';updateModeLabels()"> NintiDetect</label>
+      <label id="lbl_rtsp"><input type="radio" name="mode" value="rtsp" onchange="pendingMode='rtsp';updateModeLabels()"> RTSP</label>
+    </div>
+    <div class="s-row" style="margin-top:8px">
+      <button onclick="applyMode()" style="flex:1">Switch Mode</button>
+      <span class="hint" id="modeStatus"></span>
+    </div>
+    <div class="row hint" style="margin-top:4px;gap:8px">
+      <span class="dot" id="dotRtsp"></span> rtsp
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Camera</h2>
+    <div class="s-row">
+      <span class="s-label">Resolution</span>
+      <select id="senRes" style="flex:1">
+        <option value="1280,720">1280 x 720</option>
+        <option value="1920,1080">1920 x 1080 (HD)</option>
+        <option value="2560,1440">2560 x 1440 (QHD)</option>
+      </select>
+    </div>
+    <div class="s-row">
+      <span class="s-label">FPS cap</span>
+      <input type="range" id="fpsCap" min="0" max="30" step="1" value="15" style="flex:1"
+             oninput="document.getElementById('fpsv').textContent=this.value==0?'off':this.value">
+      <span id="fpsv" style="width:32px;text-align:right">15</span>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Threshold</h2>
+    <div class="s-row">
+      <input type="range" id="th" min="0.05" max="0.95" step="0.05" value="0.45" style="flex:1"
+             oninput="document.getElementById('thv').textContent=parseFloat(this.value).toFixed(2)">
+      <span id="thv" style="width:36px;text-align:right">0.45</span>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Motion Detect</h2>
+    <div class="s-row">
+      <button id="btnMotion" onclick="toggleMotion()" style="flex:1">-</button>
+    </div>
+    <div class="s-row">
+      <span class="s-label">Sensitivity</span>
+      <input type="range" id="mth" min="5" max="50" step="5" value="20" style="flex:1"
+             oninput="document.getElementById('mthv').textContent=this.value">
+      <span id="mthv" style="width:28px;text-align:right">20</span>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Filter Classes</h2>
+    <div id="fclasses"></div>
+  </div>
+
+  <div class="s-section">
+    <h2>Detections Log</h2>
+    <div id="log"></div>
+  </div>
+
+  <button onclick="applyAll()" class="act apply-all-btn" style="width:100%;padding:10px;font-size:13px;margin-top:8px">Apply</button>
+
+</div>
+</div>
+
+<!-- hidden compat elements -->
+<div style="display:none">
+  <div id="events"></div>
+  <span id="eventStatus"></span>
+  <span id="stRtsp"></span>
 </div>
 
 <script>
 const PALETTE=['#f55','#5af','#5f5','#fa5','#a5f','#ff5','#5ff'];
-let cfg={mode:'ninti',threshold:0.45,zones:[],filter_classes:['person','vehicle','animal']};
+const INFER_SZ=640; const MAX_DET_ZONES=4;
+let liveActiveZone=null;  // [x,y,size] from stream_yolo when active follower is on
+let liveActiveZoneTs=0;
+// When the user drags the active zone, suppress live-position overrides on the
+// render so they can see their new size/position. Cleared by applyDetector
+// (i.e. once the new value has been sent to stream_yolo).
+let dzCfgDirty=false;
+let cfg={mode:'ninti',threshold:0.45,zones:[],filter_classes:['person','vehicle','animal'],
+         detection_zones:[],active_detector:false,sensor_width:1280,sensor_height:720};
 let drawing=null;
 let hover=null;
 let flashes=[];
 let ip='';
 let es=null;
 let pendingMode='ninti';
+let dzDrag=null;  // {idx,offX,offY} during detection-zone drag
+let eventPlaybackTimer=null;
 
 const streamEl=document.getElementById('stream');
 const cvs=document.getElementById('overlay');
@@ -660,6 +1252,17 @@ function loadConf(){
       document.getElementById('mth').value=ms;
       document.getElementById('mthv').textContent=ms;
       updateMotionBtn();
+      if(!Array.isArray(cfg.detection_zones)) cfg.detection_zones=[];
+      cfg.detection_zones.forEach(z=>{ if(!z.size) z.size=INFER_SZ; });
+      cfg.active_detector = !!c.active_detector;
+      cfg.sensor_width = c.sensor_width||1280;
+      cfg.sensor_height= c.sensor_height||720;
+      const sr=document.getElementById('senRes');
+      if(sr) sr.value=cfg.sensor_width+','+cfg.sensor_height;
+      const fc=document.getElementById('fpsCap');
+      const tfps=(c.target_fps==null)?15:c.target_fps;
+      if(fc){fc.value=tfps; document.getElementById('fpsv').textContent=tfps==0?'off':tfps;}
+      renderDzList();
       renderZones(); renderClasses();
     }).catch(e=>setStatus('load config failed: '+e));
 }
@@ -671,26 +1274,116 @@ function saveConf(){
 }
 
 function loadEvents(){
-  const el=document.getElementById('events');
-  const st=document.getElementById('eventStatus');
+  const listEl=document.getElementById('eventsLeft');
+  const countEl=document.getElementById('eventStatusLeft');
   if(!ip)return;
   fetch('http://'+ip+':7778/api/events')
     .then(r=>r.json()).then(rows=>{
-      el.innerHTML='';
-      st.textContent=rows.length+' rows';
-      if(!rows.length){el.innerHTML='<div class="hint">No events yet</div>';return;}
+      if(countEl) countEl.textContent=rows.length+' events';
+      if(!listEl) return;
+      if(!rows.length){
+        listEl.innerHTML='<div class="ev-noresult">No events yet</div>';
+        return;
+      }
+      listEl.innerHTML='';
       rows.slice().reverse().forEach(e=>{
-        const div=document.createElement('div');
-        div.className='ev';
-        const dur=e.duration_s!==undefined ? ` ${Number(e.duration_s).toFixed(1)}s` : '';
-        const sc=e.best_score!==undefined ? ` ${(Number(e.best_score)*100).toFixed(0)}%` : '';
-        div.textContent=`${e.type} #${e.track_id} ${e.cat||''}/${e.name||''}${sc}${dur}`;
-        el.appendChild(div);
+        const hasVideo=!!(e.video_url||e.frames_url||e.event_meta_url);
+        const dur=e.duration_s!==undefined ? Number(e.duration_s).toFixed(1)+'s' : '';
+        const sc=e.best_score!==undefined ? (Number(e.best_score)*100).toFixed(0)+'%' : '';
+        const thumb=thumbForEvent(e);
+        const item=document.createElement('div');
+        item.className='ev-mini'+(hasVideo?' video':'');
+        item.innerHTML=
+          `<div class="ev-thumb-wrap">`+
+            (thumb?`<img src="http://${ip}:7778${thumb}" loading="lazy">`:'<div class="ev-no-thumb">?</div>')+
+          `</div>`+
+          `<div class="ev-info">`+
+            `<div class="ev-head">`+
+              `<span class="ev-cat">${e.cat||'?'}</span>`+
+              `<span class="ev-score">${sc}</span>`+
+            `</div>`+
+            `<div class="muted">${e.name||''}&nbsp;<span class="ev-dur">${dur}</span></div>`+
+          `</div>`;
+        if(hasVideo){
+          item.onclick=()=>openLightbox(e);
+        }
+        listEl.appendChild(item);
       });
-      el.scrollTop=el.scrollHeight;
-    }).catch(e=>{
-      st.textContent='failed';
+      listEl.scrollTop=0;
+    }).catch(()=>{
+      if(countEl) countEl.textContent='failed';
     });
+}
+
+function openLightbox(e){
+  const lb=document.getElementById('ev-lightbox');
+  lb.classList.add('open');
+  document.getElementById('ev-meta').textContent='';
+  playEvent(e);
+}
+function closeLightbox(){
+  const lb=document.getElementById('ev-lightbox');
+  lb.classList.remove('open');
+  const player=document.getElementById('eventPlayer');
+  player.pause();
+  player.src='';
+  player.style.display='none';
+  if(eventPlaybackTimer){clearInterval(eventPlaybackTimer);eventPlaybackTimer=null;}
+  document.getElementById('eventFramePlayer').style.display='none';
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeLightbox();});
+document.getElementById('ev-lightbox').addEventListener('click',function(e){if(e.target===this)closeLightbox();});
+function playEvent(e){
+  if(!e)return;
+  const metaUrl=e.event_meta_url || (e.event_dir ? e.event_dir+'/event.json' : (e.video_url ? e.video_url.replace(/event\\.mp4$/, 'event.json') : ''));
+  if(metaUrl){
+    fetch('http://'+ip+':7778'+metaUrl)
+      .then(r=>r.json()).then(meta=>playEventFrames({...e,...meta}))
+      .catch(()=>playEventFrames(e));
+  } else {
+    playEventFrames(e);
+  }
+}
+function playEventFrames(e){
+  if(eventPlaybackTimer){clearInterval(eventPlaybackTimer);eventPlaybackTimer=null;}
+  const player=document.getElementById('eventPlayer');
+  player.pause();
+  player.style.display='none';
+  const framePlayer=document.getElementById('eventFramePlayer');
+  const framesUrl=e.frames_url || (e.event_dir ? e.event_dir+'/frames/' : (e.video_url ? e.video_url.replace(/event\\.mp4$/, 'frames/') : ''));
+  const n=parseInt(e.num_frames||0);
+  const fps=parseFloat(e.record_fps||25);
+  if(!framesUrl || !n){
+    playEventMp4(e.video_url);
+    return;
+  }
+  let idx=0;
+  framePlayer.style.display='block';
+  const urls=[];
+  for(let i=0;i<n;i++){
+    urls.push('http://'+ip+':7778'+framesUrl+'frame_'+String(i).padStart(5,'0')+'.jpg');
+  }
+  const cache=urls.map(u=>{const img=new Image(); img.src=u; return img;});
+  const step=()=>{
+    framePlayer.src=cache[idx].src;
+    idx=(idx+1)%n;
+  };
+  step();
+  eventPlaybackTimer=setInterval(step, Math.max(100, 1000/fps));
+}
+function playEventMp4(url){
+  if(!url)return;
+  if(eventPlaybackTimer){clearInterval(eventPlaybackTimer);eventPlaybackTimer=null;}
+  document.getElementById('eventFramePlayer').style.display='none';
+  const player=document.getElementById('eventPlayer');
+  player.style.display='block';
+  player.src='http://'+ip+':7778'+url;
+  player.play().catch(()=>{});
+}
+function thumbForEvent(e){
+  if(e.thumbnail_url)return e.thumbnail_url;
+  if(e.video_url)return e.video_url.replace(/event\\.mp4$/, 'best_frame.jpg');
+  return '';
 }
 
 function toggleMotion(){
@@ -760,11 +1453,15 @@ function pollStatus(){
         stY.textContent=s.yolo?'running':'stopped';
         stY.className='st-val '+(s.yolo?'on':'off');
         const stR=document.getElementById('stRtsp');
-        stR.textContent=s.rtsp?'running':'stopped';
-        stR.className='st-val '+(s.rtsp?'on':'off');
+        if(stR){stR.textContent=s.rtsp?'running':'stopped';
+          stR.className='st-val '+(s.rtsp?'on':'off');}
         const trackCount=s.tracks||0;
         document.getElementById('stTracks').textContent=trackCount;
         document.getElementById('stThresh').textContent=parseFloat(cfg.threshold||0).toFixed(2);
+        const stT=document.getElementById('stTemp');
+        if(s.soc_temp!=null){stT.textContent=s.soc_temp.toFixed(1)+'\\u00b0C';
+          stT.className='st-val '+(s.soc_temp>=85?'warn':s.soc_temp>=75?'warn':'on');}
+        else{stT.textContent='-';stT.className='st-val';}
         // keep TRACKING node lit while objects are being tracked
         const tn=document.getElementById('pn-track');
         if(tn){
@@ -785,7 +1482,7 @@ function pollStatus(){
 function openSSE(){
   if(es)es.close();
   es=new EventSource('http://'+ip+':7778/events');
-  es.onmessage=e=>{try{const d=JSON.parse(e.data);if(d._fps!==undefined)onFps(d);else if(d._motion)onMotion(d);else if(d._save)onSave(d);else if(d._discard)onDiscard(d);else onDet(d);}catch{}};
+  es.onmessage=e=>{try{const d=JSON.parse(e.data);if(d._fps!==undefined)onFps(d);else if(d._active_zone)onActiveZone(d);else if(d._motion)onMotion(d);else if(d._save)onSave(d);else if(d._discard)onDiscard(d);else onDet(d);}catch{}};
   es.onopen=()=>setStatus('Connected');
   es.onerror=()=>setStatus('SSE offline, retrying...');
 }
@@ -822,6 +1519,10 @@ function pnClear(id){
 function onFps(d){
   const el=document.getElementById('stFps');
   if(el) el.textContent=d._fps.toFixed(1)+' fps';
+}
+function onActiveZone(d){
+  liveActiveZone=d._active_zone;
+  liveActiveZoneTs=Date.now();
 }
 function onDet(d){
   const log=document.getElementById('log');
@@ -877,12 +1578,17 @@ function onDiscard(d){
 function syncCvs(){
   const lr=streamEl.getBoundingClientRect();
   const pr=streamEl.parentElement.getBoundingClientRect();
-  cvs.width=streamEl.naturalWidth||224;
-  cvs.height=streamEl.naturalHeight||224;
-  cvs.style.left=(lr.left-pr.left)+'px';
-  cvs.style.top=(lr.top-pr.top)+'px';
-  cvs.style.width=lr.width+'px';
-  cvs.style.height=lr.height+'px';
+  const nw=streamEl.naturalWidth||640, nh=streamEl.naturalHeight||360;
+  // compute actual rendered rect (object-fit:contain inside lr)
+  const scale=Math.min(lr.width/nw, lr.height/nh);
+  const rw=nw*scale, rh=nh*scale;
+  const rx=(lr.width-rw)/2, ry=(lr.height-rh)/2;
+  cvs.width=nw;
+  cvs.height=nh;
+  cvs.style.left=(lr.left-pr.left+rx)+'px';
+  cvs.style.top=(lr.top-pr.top+ry)+'px';
+  cvs.style.width=rw+'px';
+  cvs.style.height=rh+'px';
 }
 streamEl.onload=syncCvs;
 window.addEventListener('resize',syncCvs);
@@ -901,14 +1607,169 @@ function canvasToNorm(e){
 }
 function dist(a,b){return Math.hypot(a[0]-b[0],a[1]-b[1]);}
 
+// Detection-zone drag (yellow boxes) -- takes precedence over polygon drawing.
+function eventToPx(e){
+  const [nx,ny]=canvasToNorm(e);
+  return [nx*cfg.sensor_width, ny*cfg.sensor_height];
+}
+function eventToPxOn(e, theCanvas){
+  const r=theCanvas.getBoundingClientRect();
+  const vx=(e.clientX-r.left)/r.width, vy=(e.clientY-r.top)/r.height;
+  const [nx,ny]=viewToRaw(vx,vy);
+  return [nx*cfg.sensor_width, ny*cfg.sensor_height];
+}
+function zoneSize(z){ return z.size||INFER_SZ; }
+// 32 sensor-px handle in the bottom-right corner; returns 'resize' or 'move'.
+function hitDzAt(px,py){
+  const zs=cfg.detection_zones||[];
+  for(let i=zs.length-1;i>=0;i--){
+    // For the active follower (zone 0), hit-test against the visible live
+    // position rather than the static config position, otherwise the user
+    // clicks the orange box and nothing happens.
+    let zx=zs[i].x, zy=zs[i].y, s=zoneSize(zs[i]);
+    if(i===0 && cfg.active_detector && liveActiveZone && !dzCfgDirty){
+      zx=liveActiveZone[0]; zy=liveActiveZone[1]; s=liveActiveZone[2];
+    }
+    if(px>=zx && px<zx+s && py>=zy && py<zy+s){
+      const inHandle = px>=zx+s-32 && py>=zy+s-32;
+      return {idx:i, mode: inHandle?'resize':'move'};
+    }
+  }
+  return null;
+}
+cvs.addEventListener('mousedown',e=>{
+  if(drawing) return;
+  const [px,py]=eventToPx(e);
+  const hit=hitDzAt(px,py);
+  if(!hit) return;
+  const z=cfg.detection_zones[hit.idx];
+  // Active zone hit: snapshot only the live tracked X/Y into config so the
+  // drag operates on the visible position. Size is preserved -- if the user
+  // already resized but hasn't applied, that pending size stays. Suppress
+  // live overrides until apply.
+  if(hit.idx===0 && cfg.active_detector && liveActiveZone){
+    z.x=liveActiveZone[0]; z.y=liveActiveZone[1];
+    dzCfgDirty=true;
+  }
+  if(hit.mode==='resize'){
+    dzDrag={idx:hit.idx, mode:'resize', dragged:false, srcCanvas:cvs};
+  } else {
+    dzDrag={idx:hit.idx, mode:'move', offX:px-z.x, offY:py-z.y, dragged:false, srcCanvas:cvs};
+  }
+  e.preventDefault();
+});
+window.addEventListener('mousemove',e=>{
+  if(!dzDrag) return;
+  const [px,py]=eventToPxOn(e, dzDrag.srcCanvas||cvs);
+  const sw=cfg.sensor_width, sh=cfg.sensor_height;
+  const z=cfg.detection_zones[dzDrag.idx];
+  if(dzDrag.mode==='resize'){
+    // New size = distance from zone origin to cursor (cap by frame).
+    let ns=Math.round(Math.min(px-z.x, py-z.y));
+    ns=Math.max(INFER_SZ, Math.min(ns, sw-z.x, sh-z.y));
+    z.size=ns;
+  } else {
+    const s=zoneSize(z);
+    let nx=Math.round(px-dzDrag.offX), ny=Math.round(py-dzDrag.offY);
+    nx=Math.max(0,Math.min(nx,sw-s));
+    ny=Math.max(0,Math.min(ny,sh-s));
+    z.x=nx; z.y=ny;
+  }
+  dzDrag.dragged=true;
+  renderDzList();
+});
+window.addEventListener('mouseup',()=>{ if(dzDrag) dzDrag=null; });
+
 cvs.addEventListener('mousemove',e=>{if(drawing)hover=canvasToNorm(e);});
 cvs.addEventListener('click',e=>{
-  if(!drawing)return;
+  if(dzDrag) return;  // drag took precedence (mouseup may race)
+  if(!drawing){
+    // Suppress click if it ended a drag
+    const [px,py]=eventToPx(e);
+    if(hitDzAt(px,py)) return;
+    return;
+  }
   const pt=canvasToNorm(e);
   if(drawing.pts.length>=3&&dist(pt,drawing.pts[0])<0.04){closeZone();return;}
   drawing.pts.push(pt);
 });
 cvs.addEventListener('contextmenu',e=>{e.preventDefault();closeZone();});
+
+// Detection-zone CRUD + apply
+function addDetZone(){
+  if(!cfg.detection_zones) cfg.detection_zones=[];
+  if(cfg.detection_zones.length>=MAX_DET_ZONES){setStatus('Max '+MAX_DET_ZONES+' zones.');return;}
+  const sw=cfg.sensor_width, sh=cfg.sensor_height;
+  const cx=Math.round((sw-INFER_SZ)/2), cy=Math.round((sh-INFER_SZ)/2);
+  const off=cfg.detection_zones.length*40;
+  cfg.detection_zones.push({
+    x:Math.max(0,Math.min(cx+off,sw-INFER_SZ)),
+    y:Math.max(0,Math.min(cy+off,sh-INFER_SZ)),
+    size:INFER_SZ});
+  renderDzList();
+}
+function delLastDetZone(){
+  if(!cfg.detection_zones||!cfg.detection_zones.length)return;
+  cfg.detection_zones.pop(); renderDzList();
+}
+function toggleActiveDetector(){
+  if(cfg.active_detector && liveActiveZone && cfg.detection_zones && cfg.detection_zones[0]){
+    cfg.detection_zones[0].x=liveActiveZone[0];
+    cfg.detection_zones[0].y=liveActiveZone[1];
+  }
+  cfg.active_detector=!cfg.active_detector;
+  if(!cfg.active_detector) liveActiveZone=null;
+  const b=document.getElementById('activeBtn');
+  if(b) b.textContent='Zone 1 follower: '+(cfg.active_detector?'ON':'OFF');
+  renderDzList();
+  // apply immediately -- no separate button press needed
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({active_detector:!!cfg.active_detector,_restart:true})
+  }).then(()=>setStatus('Follower '+(cfg.active_detector?'ON':'OFF')+', restarting...'))
+    .catch(e=>setStatus(''+e));
+}
+function renderDzList(){
+  const el=document.getElementById('dzlist');
+  if(!el)return;
+  const zs=cfg.detection_zones||[];
+  if(!zs.length){el.textContent='No zones -- stream_yolo defaults to single center zone.';return;}
+  el.innerHTML=zs.map((z,i)=>{
+    const tag=(i===0 && cfg.active_detector)?' <span style="color:#ff8800">[active]</span>':'';
+    return `<div>#${i+1} at (${z.x},${z.y}) size=${z.size||INFER_SZ}${tag}</div>`;
+  }).join('');
+  const b=document.getElementById('activeBtn');
+  if(b) b.textContent='Zone 1 follower: '+(cfg.active_detector?'ON':'OFF');
+}
+function applyAll(){
+  const sr=document.getElementById('senRes').value.split(',');
+  cfg.sensor_width=parseInt(sr[0]);
+  cfg.sensor_height=parseInt(sr[1]);
+  const sw=cfg.sensor_width, sh=cfg.sensor_height;
+  (cfg.detection_zones||[]).forEach(z=>{
+    z.size=Math.max(INFER_SZ,Math.min(z.size||INFER_SZ,sw,sh));
+    z.x=Math.max(0,Math.min(z.x,sw-z.size));
+    z.y=Math.max(0,Math.min(z.y,sh-z.size));
+  });
+  cfg.target_fps=parseInt(document.getElementById('fpsCap').value);
+  cfg.threshold=parseFloat(document.getElementById('th').value);
+  cfg.motion_sensitivity=parseInt(document.getElementById('mth').value);
+  renderDzList();
+  const btns=document.querySelectorAll('.apply-all-btn');
+  btns.forEach(b=>{b.disabled=true;b.textContent='Applying...';});
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({...cfg,_restart:true})
+  }).then(()=>{
+    dzCfgDirty=false;
+    setStatus('Applied & restarting...');
+    btns.forEach(b=>{b.disabled=false;b.textContent='Apply';});
+  }).catch(e=>{
+    setStatus(''+e);
+    btns.forEach(b=>{b.disabled=false;b.textContent='Apply';});
+  });
+}
+function applyDetector(){applyAll();}
 
 function newZone(){
   const name=document.getElementById('zname').value.trim()||('Zone '+(cfg.zones.length+1));
@@ -929,6 +1790,37 @@ function frame(){
   syncCvs();
   const W=cvs.width,H=cvs.height;
   ctx.clearRect(0,0,W,H);
+
+  // Detection zones (yellow dashed normal; orange when zone 0 is active follower).
+  // While stream_yolo is reporting live _active_zone, zone 0 renders at the
+  // tracked position instead of the config position.
+  const sw=cfg.sensor_width||1280, sh=cfg.sensor_height||720;
+  (cfg.detection_zones||[]).forEach((z,i)=>{
+    const isActive=(i===0 && !!cfg.active_detector);
+    const dragging=dzDrag&&dzDrag.idx===i;
+    let zx=z.x, zy=z.y, zs=z.size||INFER_SZ;
+    // Show live position only when active and the user isn't editing.
+    if(isActive && liveActiveZone && !dragging && !dzCfgDirty){
+      zx=liveActiveZone[0]; zy=liveActiveZone[1]; zs=liveActiveZone[2];
+    }
+    const x=zx*W/sw, y=zy*H/sh;
+    const w=zs*W/sw, h=zs*H/sh;
+    const col=isActive?'#ff8800':'#ffcc00';
+    ctx.setLineDash([8,4]);
+    ctx.strokeStyle=dragging?'#ff0':col;
+    ctx.lineWidth=dragging?3:2;
+    ctx.strokeRect(x,y,w,h);
+    ctx.setLineDash([]);
+    ctx.fillStyle=isActive?'rgba(255,136,0,0.10)':'rgba(255,204,0,0.10)';
+    ctx.fillRect(x,y,w,h);
+    // Resize handle (right-bottom corner) -- 32 sensor px -> scale
+    const hsx=Math.max(4, 32*W/sw), hsy=Math.max(4, 32*H/sh);
+    ctx.fillStyle=col;
+    ctx.fillRect(x+w-hsx, y+h-hsy, hsx, hsy);
+    ctx.font='11px monospace';
+    ctx.fillText('zone '+(i+1)+(isActive?' [active]':'')+' ('+zx+','+zy+') sz='+zs, x+4, y+13);
+  });
+
   cfg.zones.forEach((z,i)=>{
     if(!z.points||z.points.length<2)return;
     const col=PALETTE[i%PALETTE.length];
@@ -1012,8 +1904,46 @@ function setStatus(msg){
     document.getElementById('status').textContent='';},4000);
 }
 
+function showMainTab(name, btn){
+  document.querySelectorAll('.nav-tab').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.main-tab').forEach(p=>p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('main-'+name).classList.add('active');
+  if(name==='events') loadEvents();
+}
+
 if(document.getElementById('ip').value) connect();
+
+// ---- HLS player ----
+let _hlsObj = null;
+let _streamMode = 'mjpeg';
+function setStream(mode) {
+  const ip = document.getElementById('ip').value.trim();
+  const mjpegEl = document.getElementById('stream');
+  const hlsEl   = document.getElementById('hlsPlayer');
+  _streamMode = mode;
+  if (mode === 'hls') {
+    mjpegEl.src = ''; mjpegEl.style.display = 'none';
+    hlsEl.style.display = 'block';
+    const hlsUrl = 'http://' + ip + ':7778/hls/live.m3u8';
+    if (hlsEl.canPlayType('application/vnd.apple.mpegurl')) {
+      hlsEl.src = hlsUrl; hlsEl.play();
+    } else if (window.Hls && Hls.isSupported()) {
+      if (_hlsObj) _hlsObj.destroy();
+      _hlsObj = new Hls({lowLatencyMode: true});
+      _hlsObj.loadSource(hlsUrl);
+      _hlsObj.attachMedia(hlsEl);
+      _hlsObj.on(Hls.Events.MANIFEST_PARSED, () => hlsEl.play());
+    }
+  } else {
+    if (_hlsObj) { _hlsObj.destroy(); _hlsObj = null; }
+    hlsEl.src = ''; hlsEl.style.display = 'none';
+    mjpegEl.style.display = '';
+    mjpegEl.src = 'http://' + ip + ':7778/stream';
+  }
+}
 </script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 </body>
 </html>'''
 
@@ -1026,10 +1956,78 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
 
+    def _serve_event_file(self, path, head_only=False):
+        rel = path[len('/event-video/'):]
+        rel = os.path.normpath(rel).lstrip('/')
+        full = os.path.abspath(os.path.join(EVENT_DIR, rel))
+        root = os.path.abspath(EVENT_DIR)
+        if not full.startswith(root + os.sep) or not os.path.exists(full):
+            self.send_response(404)
+            self.end_headers()
+            return
+        ctype = 'application/octet-stream'
+        if full.endswith('.mp4'):
+            ctype = 'video/mp4'
+        elif full.endswith('.jpg') or full.endswith('.jpeg'):
+            ctype = 'image/jpeg'
+        elif full.endswith('.json'):
+            ctype = 'application/json'
+
+        size = os.path.getsize(full)
+        start, end = 0, size - 1
+        status = 200
+        rng = self.headers.get('Range', '')
+        if rng.startswith('bytes='):
+            spec = rng.split('=', 1)[1].split(',', 1)[0].strip()
+            a, _, b = spec.partition('-')
+            try:
+                if a:
+                    start = int(a)
+                if b:
+                    end = int(b)
+                if not a and b:
+                    start = max(0, size - int(b))
+                    end = size - 1
+                start = max(0, min(start, size - 1))
+                end = max(start, min(end, size - 1))
+                status = 206
+            except Exception:
+                start, end, status = 0, size - 1, 200
+
+        length = max(0, end - start + 1)
+        self.send_response(status)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Content-Length', str(length))
+        if status == 206:
+            self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+        self.send_header('Cache-Control', 'no-cache')
+        self._cors()
+        self.end_headers()
+        if head_only:
+            return
+        with open(full, 'rb') as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(1024 * 256, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
     def do_OPTIONS(self):
         self.send_response(200)
         self._cors()
         self.end_headers()
+
+    def do_HEAD(self):
+        path = urlparse(self.path).path
+        if path.startswith('/event-video/'):
+            self._serve_event_file(path, head_only=True)
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -1053,11 +2051,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self._cors()
             self.end_headers()
+            soc_temp = None
+            try:
+                with open('/sys/class/thermal/thermal_zone0/temp') as _t:
+                    soc_temp = round(int(_t.read().strip()) / 1000.0, 1)
+            except Exception:
+                pass
             status = {
                 'mode': cfg.get('mode', 'ninti'),
                 'yolo': _yolo_running(),
                 'rtsp': _rtsp_running(),
                 'tracks': len(tracks),
+                'soc_temp': soc_temp,
             }
             self.wfile.write(json.dumps(status).encode())
 
@@ -1072,7 +2077,10 @@ class Handler(BaseHTTPRequestHandler):
                         if not line:
                             continue
                         try:
-                            rows.append(json.loads(line))
+                            rec = json.loads(line)
+                            if rec.get('video_url') and not _valid_event_video_url(rec.get('video_url')):
+                                continue
+                            rows.append(rec)
                         except Exception:
                             pass
             except Exception as e:
@@ -1083,24 +2091,61 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(rows).encode())
 
+        elif path.startswith('/event-video/'):
+            self._serve_event_file(path)
+
+        elif path.startswith('/hls/'):
+            rel = path[len('/hls/'):]
+            rel = os.path.normpath(rel).lstrip('/')
+            full = os.path.abspath(os.path.join('/tmp/hls', rel))
+            if not full.startswith('/tmp/hls') or not os.path.exists(full):
+                self.send_response(404); self.end_headers(); return
+            ctype = 'application/vnd.apple.mpegurl' if full.endswith('.m3u8') else 'video/MP2T'
+            data = open(full, 'rb').read()
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', len(data))
+            self.send_header('Cache-Control', 'no-cache')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(data)
+
         elif path == '/stream':
+            global stream_clients
             try:
-                conn = http.client.HTTPConnection('127.0.0.1', MJPEG_PORT, timeout=5)
-                conn.request('GET', '/')
-                resp = conn.getresponse()
                 self.send_response(200)
-                self.send_header('Content-Type', resp.getheader('Content-Type', 'multipart/x-mixed-replace; boundary=mjpegstream'))
+                self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
                 self.send_header('Cache-Control', 'no-cache')
                 self._cors()
                 self.end_headers()
+                with stream_lock:
+                    stream_clients += 1
+                    stream_lock.notify_all()
+                last_id = -1
                 while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+                    with stream_lock:
+                        stream_lock.wait_for(
+                            lambda: latest_stream_jpg is not None and latest_stream_id != last_id,
+                            timeout=10,
+                        )
+                        if latest_stream_jpg is None or latest_stream_id == last_id:
+                            continue
+                        jpg = latest_stream_jpg
+                        last_id = latest_stream_id
+                    header = (
+                        b'--frame\r\n'
+                        b'Content-Type: image/jpeg\r\n'
+                        + f'Content-Length: {len(jpg)}\r\n\r\n'.encode()
+                    )
+                    self.wfile.write(header)
+                    self.wfile.write(jpg)
+                    self.wfile.write(b'\r\n')
                     self.wfile.flush()
             except Exception:
                 pass
+            finally:
+                with stream_lock:
+                    stream_clients = max(0, stream_clients - 1)
 
         elif path == '/events':
             self.send_response(200)
@@ -1153,6 +2198,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(str(e).encode())
 
+        elif path == '/api/shutdown':
+            # Gracefully stop stream_yolo (allows VPSS teardown) then exit.
+            # Call this before deploying a new sidecar so VPSS is released cleanly.
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+            def _do_shutdown():
+                import time as _t; import os as _os
+                _t.sleep(0.2)
+                stop_yolo()
+                _t.sleep(2)
+                _os.kill(_os.getpid(), 15)
+            threading.Thread(target=_do_shutdown, daemon=True).start()
+
         elif path == '/api/mode':
             try:
                 new = json.loads(body)
@@ -1198,6 +2259,7 @@ if __name__ == '__main__':
     threading.Thread(target=udp_listener, daemon=True).start()
     threading.Thread(target=_watchdog, daemon=True).start()
     threading.Thread(target=_motion_detector, daemon=True).start()
+    threading.Thread(target=_storage_cleanup_loop, daemon=True).start()
 
     # Apply saved mode on startup
     saved_mode = cfg.get('mode', 'ninti')

@@ -66,7 +66,7 @@ MJPEGWriter::Writer()
 {
     pthread_mutex_lock(&mutex_writer);
     pthread_mutex_unlock(&mutex_writer);
-    const int milis2wait = 16666;
+    const int milis2wait = 250000;
     while (this->isOpened())
     {
         pthread_mutex_lock(&mutex_client);
@@ -83,9 +83,17 @@ MJPEGWriter::Writer()
         std::vector<int> params;
         params.push_back(cv::IMWRITE_JPEG_QUALITY);
         params.push_back(quality);
+        Mat frame;
         pthread_mutex_lock(&mutex_writer);
-        imencode(".jpg", lastFrame, outbuf, params);
+        if (!lastFrame.empty()) {
+            frame = lastFrame.clone();
+        }
         pthread_mutex_unlock(&mutex_writer);
+        if (frame.empty()) {
+            usleep(milis2wait);
+            continue;
+        }
+        imencode(".jpg", frame, outbuf, params);
         int outlen = outbuf.size();
 
         pthread_mutex_lock(&mutex_client);

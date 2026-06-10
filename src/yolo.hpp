@@ -1,7 +1,7 @@
 #pragma once
 
 #include "cvi_tdl.h"
-#include "../../../sdk/sample/3rd/tpu/include/cviruntime.h"
+#include "cviruntime.h"
 #include <opencv2/opencv.hpp>
 
 class YoloModelDetector {

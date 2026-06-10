@@ -5,8 +5,9 @@
 set -e
 THRESH=${1:-0.50}
 PORT=${2:-5005}
-MODEL=/root/yolov5_cv181x.cvimodel
+MODEL=/root/yolov8n_maixcam_640.cvimodel
 
 export LD_LIBRARY_PATH=/mnt/system/usr/lib:/usr/bin/lib:/root/libs_patch
 
 exec /root/stream_yolo "$MODEL" 80 640 "$THRESH" "$PORT" 640 360
+
