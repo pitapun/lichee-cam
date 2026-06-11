@@ -253,6 +253,11 @@ def _mqtt_publish_many(messages):
                     raise RuntimeError(f'connect refused {resp!r}')
                 for topic, payload, retain in messages:
                     s.sendall(_mqtt_publish_packet(topic, payload, retain))
+                try:
+                    s.shutdown(socket.SHUT_WR)
+                except Exception:
+                    pass
+                time.sleep(0.05)
                 mqtt_state['last_error'] = ''
                 mqtt_state['last_pub'] = time.time()
                 return True
