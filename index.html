@@ -597,7 +597,7 @@ function pollStatus(){
         document.getElementById('stTracks').textContent=trackCount;
         document.getElementById('stThresh').textContent=parseFloat(cfg.threshold||0).toFixed(2);
         const stT=document.getElementById('stTemp');
-        if(s.soc_temp!=null){stT.textContent=s.soc_temp.toFixed(1)+'\\u00b0C';
+        if(s.soc_temp!=null){stT.textContent=s.soc_temp.toFixed(1)+'°C';
           stT.className='st-val '+(s.soc_temp>=85?'warn':s.soc_temp>=75?'warn':'on');}
         else{stT.textContent='-';stT.className='st-val';}
         // keep TRACKING node lit while objects are being tracked

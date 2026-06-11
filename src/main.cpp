@@ -807,6 +807,19 @@ int main(int argc, char *argv[]) {
     long acc_cap=0, acc_motion=0, acc_infer=0, acc_nms_draw=0, acc_mjpeg=0;
     long acc_clone=0, acc_hls_send=0;
 
+    // Pre-init CHN1 (event recorder) before the main loop so the first event
+    // recording never stalls the loop with a 1-2s CVI_VENC_CreateChn call.
+    // Capture one raw frame to discover sensor dimensions, then release it.
+    {
+        VIDEO_FRAME_INFO_S* raw_f = (VIDEO_FRAME_INFO_S*)cap.captureRaw();
+        if (raw_f) {
+            VIDEO_FRAME_S& vf = raw_f->stVFrame;
+            cap.releaseImagePtr();  // release before CreateChn (avoids VI stall)
+            int rec_fps = target_fps > 0 ? target_fps : 25;
+            h264rec.init((int)vf.u32Width, (int)vf.u32Height, rec_fps);
+        }
+    }
+
     // Start HLS VENC before the main loop so CreateChn never runs while a VI
     // frame is in-flight (which causes VI GetChnFrame to block permanently).
     if (ENABLE_HLS) {
