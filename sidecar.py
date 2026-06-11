@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     'mqtt_discovery_prefix': 'homeassistant',
     'mqtt_base_topic': 'nintidetect/195',
     'mqtt_device_name': 'NintiDetect 195',
+    'public_base_url': 'http://192.168.100.195:7778',
 }
 INFER_SIZE = 640
 MAX_ZONES  = 4
@@ -305,6 +306,11 @@ def _mqtt_discovery_messages():
             'value_template': '{{ value_json.name }}',
             'json_attributes_topic': f'{base}/event',
         }),
+        ('sensor', 'recent_events', {
+            'name': 'Recent Events', 'state_topic': f'{base}/recent_events',
+            'value_template': '{{ value_json.latest_name }}',
+            'json_attributes_topic': f'{base}/recent_events',
+        }),
         ('binary_sensor', 'detector', {
             'name': 'Detector', 'state_topic': f'{base}/status',
             'value_template': "{{ 'ON' if value_json.yolo else 'OFF' }}",
@@ -352,6 +358,61 @@ def mqtt_publish_event(rec):
         return
     mqtt_publish_discovery()
     _mqtt_publish_many([(f"{mc['base']}/event", rec, False)])
+
+def _abs_url(path):
+    if not path:
+        return ''
+    if str(path).startswith(('http://', 'https://')):
+        return path
+    base = str(cfg.get('public_base_url') or '').rstrip('/')
+    return base + str(path)
+
+def _recent_events_payload(limit=3):
+    rows = []
+    try:
+        if os.path.exists(EVENT_FILE):
+            with open(EVENT_FILE) as f:
+                lines = f.readlines()[-100:]
+            for line in lines:
+                try:
+                    rec = json.loads(line.strip())
+                except Exception:
+                    continue
+                if not rec.get('video_url') and not rec.get('thumbnail_url'):
+                    continue
+                thumb = rec.get('thumbnail_url')
+                if not thumb and rec.get('video_url'):
+                    thumb = rec.get('video_url').replace('event.mp4', 'best_frame.jpg')
+                item = {
+                    'track_id': rec.get('track_id'),
+                    'cat': rec.get('cat'),
+                    'name': rec.get('name') or rec.get('cat') or 'event',
+                    'first_seen': rec.get('first_seen'),
+                    'duration_s': rec.get('duration_s'),
+                    'best_score': rec.get('best_score'),
+                    'thumbnail_url': thumb,
+                    'thumbnail_url_abs': _abs_url(thumb),
+                    'video_url': rec.get('video_url'),
+                    'video_url_abs': _abs_url(rec.get('video_url')),
+                    'event_meta_url': rec.get('event_meta_url'),
+                }
+                rows.append(item)
+    except Exception:
+        pass
+    recent = list(reversed(rows[-limit:]))
+    return {
+        'count': len(recent),
+        'latest_name': recent[0].get('name') if recent else 'none',
+        'events': recent,
+        'ts': time.time(),
+    }
+
+def mqtt_publish_recent_events():
+    mc = _mqtt_enabled_cfg()
+    if not mc['enabled'] or not mc['host']:
+        return
+    mqtt_publish_discovery()
+    _mqtt_publish_many([(f"{mc['base']}/recent_events", _recent_events_payload(3), True)])
 
 # ---- Point-in-polygon (ray casting) ----
 def pip(x, y, poly):
@@ -423,6 +484,7 @@ def _write_event(kind, tr, now):
         with open(EVENT_FILE, 'a') as f:
             f.write(json.dumps(rec, separators=(',', ':')) + '\n')
         mqtt_publish_event(rec)
+        mqtt_publish_recent_events()
     except Exception as e:
         print(f'[events] write error: {e}')
 
@@ -2630,6 +2692,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             mqtt_publish_status(status, force=True)
+            mqtt_publish_recent_events()
             ok = not mqtt_state.get('last_error')
             self.send_response(200 if ok else 500)
             self.send_header('Content-Type', 'application/json')
