@@ -1,64 +1,152 @@
-# lichee-cam
+# lichee-cam / NintiDetect
 
-NintiDetect on LicheeRV Nano (cv181x / GC4653 sensor).
+YOLOv8 object detector on LicheeRV Nano (cv181x SoC, GC4653 sensor).
+Serves MJPEG stream, HLS live stream, and a web UI with event recording.
 
-## Overview
+---
 
-Runs a YOLOv8 object detector on the cv181x NPU, serving:
+## Device file manifest
 
-- MJPEG stream on port 7777
-- Web UI + SSE detection events on port 7778
-- RTSP stream (via MediaMTX) on port 8554, when in RTSP mode
+Everything needed on the device. Deploy all of these on a fresh install.
 
-## Files
+| Git path | Device path | Notes |
+|----------|-------------|-------|
+| `sidecar.py` | `/root/sidecar.py` | Main process: manages stream_yolo, tracking, web server |
+| `index.html` | `/root/index.html` | Web UI HTML (read from disk — update without restart) |
+| `hls.min.js` | `/root/hls.min.js` | HLS.js player for live stream tab |
+| `S98ninti_sidecar` | `/etc/init.d/S98ninti_sidecar` | Init script (chmod +x after copy) |
+| `bin/stream_yolo` | `/root/stream_yolo` | Compiled RISC-V binary (or build from `src/`) |
+| `bin/mediamtx` | `/root/mediamtx` | RTSP relay (optional) |
+| `bin/mediamtx.yml` | `/root/mediamtx.yml` | MediaMTX config (optional) |
+| `models/yolov8n_coco80.cvimodel` | `/root/yolov8n_coco80.cvimodel` | Default detection model |
+| `models/yolov5_cv181x.cvimodel` | `/root/yolov5_cv181x.cvimodel` | Alternative model |
+| `models/yolov5su_new.cvimodel` | `/root/yolov5su_new.cvimodel` | Alternative model |
+| `models/yolov8n_maixcam_640.cvimodel` | `/root/yolov8n_maixcam_640.cvimodel` | Alternative model |
+| `libs/libcvi_tdl.so` | `/root/libs_patch/libcvi_tdl.so` | CVI TDL runtime |
+| `libs/libcvi_tdl_app.so` | `/root/libs_patch/libcvi_tdl_app.so` | CVI TDL app runtime |
+| `libs/libcvi_ive_tpu.so` | `/root/libs_patch/libcvi_ive_tpu.so` | CVI IVE TPU |
+| `libs/libini.so` | `/root/libs_patch/libini.so` | INI parser |
 
-| File | Purpose |
-|------|---------|
-| `sidecar.py` | Main process: manages stream_yolo, motion detection, tracking, web UI |
-| `S98ninti_sidecar` | init.d service script (copy to `/etc/init.d/`) |
-| `run_ninti_detect.sh` | Manual launcher for stream_yolo standalone |
-| `start_gc4653_rtsp.sh` | RTSP mode launcher (MediaMTX + sample_venc) |
+`LD_LIBRARY_PATH` in the init script includes `/root/libs_patch` so these override system libs.
 
-## Hardware
+---
 
-- Board: LicheeRV Nano (RISC-V, cv181x SoC)
-- Sensor: GC4653 (MIPI CSI, 1440p 30fps)
-- Model: `yolov5_cv181x.cvimodel` (YOLOv8, COCO 80 classes, compiled for cv181x NPU)
+## Fresh install
 
-## Detection Pipeline
+```bash
+IP=192.168.1.121   # or ProxyJump: ssh -o ProxyJump=pi5-4g root@192.168.100.195
+
+# Core files
+scp sidecar.py index.html hls.min.js root@$IP:/root/
+
+# Init script
+scp S98ninti_sidecar root@$IP:/etc/init.d/S98ninti_sidecar
+ssh root@$IP 'chmod +x /etc/init.d/S98ninti_sidecar'
+
+# Binary
+scp bin/stream_yolo root@$IP:/root/stream_yolo
+
+# Models (large — skip if already present)
+scp models/*.cvimodel root@$IP:/root/
+
+# Shared libs
+ssh root@$IP 'mkdir -p /root/libs_patch'
+scp libs/*.so root@$IP:/root/libs_patch/
+
+# Reboot to start cleanly
+ssh root@$IP reboot
+```
+
+---
+
+## Update recipes
+
+### UI only — no restart needed
+
+```bash
+scp index.html root@$IP:/root/index.html
+# Hard-refresh browser — live immediately
+```
+
+### Sidecar logic change (sidecar.py)
+
+Requires reboot — sidecar restart without reboot leaves stream_yolo in VENC deadlock.
+
+```bash
+scp sidecar.py root@$IP:/root/sidecar.py
+ssh root@$IP reboot
+```
+
+### Binary change (stream_yolo)
+
+```bash
+scp bin/stream_yolo root@$IP:/root/stream_yolo.new
+ssh root@$IP 'mv /root/stream_yolo.new /root/stream_yolo && reboot'
+```
+
+### Binary + sidecar + UI
+
+```bash
+scp bin/stream_yolo root@$IP:/root/stream_yolo.new
+scp sidecar.py index.html hls.min.js root@$IP:/root/
+ssh root@$IP 'mv /root/stream_yolo.new /root/stream_yolo && reboot'
+```
+
+Wait ~50s after reboot, then verify:
+
+```bash
+ssh root@$IP 'ls /tmp/hls/*.ts 2>/dev/null | wc -l'   # expect >= 3
+curl -s -o /dev/null -w "%{http_code}" http://$IP:7778/ # expect 200
+```
+
+---
+
+## Build
+
+See `BUILD.md` for cross-compilation setup.
+
+Quick rebuild after source change:
+
+```bash
+cd /home/thylation/Desktop/lichee-cam
+cmake --build build-yolo --target stream_yolo -j$(nproc)
+# Output: build-yolo/bin/stream_yolo
+```
+
+Copy the built binary to `bin/stream_yolo` before committing:
+
+```bash
+cp build-yolo/bin/stream_yolo bin/stream_yolo
+git add bin/stream_yolo && git commit -m "..."
+```
+
+---
+
+## Architecture
 
 ```
-MOTION DETECT  (frame diff, independent of AI)
-      |
-AI DETECT      (YOLO inference on cv181x NPU, threshold configurable)
-      |
-AI TRACKING    (center-distance + IoU tracking, 5s still/lost timeout)
-      |
-   SAVE        (any tracked object with >= 1 hit is saved to events.jsonl)
+sidecar.py
+  ├── launches stream_yolo as subprocess
+  ├── reads MJPEG frames from :7777 → pre-buffer + event JPEG frames
+  ├── receives detection UDP from stream_yolo (:5005)
+  ├── tracks objects, manages event lifecycle
+  ├── serves web UI on :7778 (index.html read from disk)
+  └── serves HLS via ffmpeg → /tmp/hls/
+
+stream_yolo (C++)
+  ├── VPSS group 0: captures from GC4653 (1280x720 disp + 2560x1440 raw)
+  ├── CHN0 VENC: HLS encoder (1280x720 H264 → /tmp/hls_feed.h264 FIFO)
+  ├── CHN1 VENC: event recorder (2560x1440 H264, active during events only)
+  ├── YOLO inference on cv181x NPU (640x640 zone crop)
+  └── MJPEG output on :7777
 ```
 
-Key behaviors:
+Key constraints:
+- CHN0 and CHN1 cannot run simultaneously — CHN0 paused during events, resumed after
+- Single-core C906 RISC-V: `cv::setNumThreads(1)` prevents OpenMP overhead
+- ION memory (VENC input): written via manual BGR→NV21 loop, not cvtColor
 
-- Motion detect fires on pixel-level frame difference on the full frame at 1/4 scale (no AI needed, fast)
-- YOLO inference runs **only on the detection zone crop** (default 640x640), not the full frame — significantly reduces NPU workload and inference latency
-- AI detect suppresses motion detect while active
-- Tracking allows up to 1s detection gap before losing a track
-- Object still for 5s or absent for 5s triggers save
-- Any object detected at least once is saved (never discarded if tracked)
-
-### Detection zone
-
-Configured as `detection_zones` in `/root/ninti_config.json` (x, y, size in sensor pixels). The YOLO model receives only the cropped zone resized to `infer_size` (640). Coordinates of detections are scaled back to full-frame space before drawing and UDP broadcast.
-
-HLS live stream is always encoded at 1280x720 regardless of sensor resolution. Sensor can be set higher (e.g. 1920x1080) for higher-quality event recordings while keeping live view at 720p.
-
-## Web UI
-
-Connect browser to `http://<board-ip>:7778`.
-
-- Left sidebar: live pipeline state visualization
-- Center: MJPEG stream with zone overlay
-- Right sidebar: mode/threshold/zone/class config, detection log, event history
+---
 
 ## Configuration
 
@@ -66,42 +154,19 @@ Connect browser to `http://<board-ip>:7778`.
 
 ```json
 {
-  "mode": "ninti",
-  "threshold": 0.60,
-  "zones": [],
-  "filter_classes": ["person", "vehicle", "animal"]
+  "threshold": 0.55,
+  "zones": [{"x": 573, "y": 169, "size": 640}],
+  "filter_classes": ["person", "cat", "dog"],
+  "motion_enabled": true,
+  "motion_sensitivity": 10,
+  "fps_cap": 5
 }
 ```
 
-## Deployment
+---
 
-Initial install on device:
+## Known issues
 
-```sh
-scp sidecar.py root@<ip>:/root/sidecar.py
-scp S98ninti_sidecar root@<ip>:/etc/init.d/S98ninti_sidecar
-ssh root@<ip> "chmod +x /etc/init.d/S98ninti_sidecar"
-```
-
-Update sidecar only (graceful, avoids VPSS conflict):
-
-```sh
-scp sidecar.py root@<ip>:/root/sidecar.py
-ssh root@<ip> "/etc/init.d/S98ninti_sidecar restart"
-# init script calls /api/yolo/stop first, then restarts — no manual curl needed
-# DO NOT use killall stream_yolo — bypasses VPSS cleanup and corrupts hardware state
-```
-
-Update binary + sidecar (requires reboot for clean VPSS state):
-
-```sh
-scp build-riscv/bin/stream_yolo root@<ip>:/root/stream_yolo.new
-scp sidecar.py root@<ip>:/root/sidecar.py
-ssh root@<ip> "mv /root/stream_yolo.new /root/stream_yolo && reboot"
-```
-
-## Known Issues
-
-- `CVI_VPSS_CreateGrp failed`: VPSS group 0 not released after forced kill of stream_yolo. Always stop via `/api/yolo/stop` before restarting. If already stuck, reboot device.
-- D-state watchdog: sidecar monitors stream_yolo for kernel D-state (60s threshold) and triggers `reboot -f` automatically.
-- GC4653 camera: 1440p 30fps, ISP tuning from lxowalle gc4653 30fps profile.
+- Sidecar restart without reboot leaves stream_yolo in VENC `EnterVcodecLock` D-state. Always reboot after sidecar.py changes.
+- `CVI_VPSS_CreateGrp failed`: VPSS not released after forced kill. Reboot to recover.
+- HLS takes ~45s after reboot before first segments appear (camera init + VENC warm-up).
