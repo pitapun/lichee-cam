@@ -311,6 +311,21 @@ def _mqtt_discovery_messages():
             'value_template': '{{ value_json.latest_name }}',
             'json_attributes_topic': f'{base}/recent_events',
         }),
+        ('sensor', 'last_person_event', {
+            'name': 'Last Person Event', 'state_topic': f'{base}/last/person',
+            'value_template': '{{ value_json.name }}',
+            'json_attributes_topic': f'{base}/last/person',
+        }),
+        ('sensor', 'last_vehicle_event', {
+            'name': 'Last Vehicle Event', 'state_topic': f'{base}/last/vehicle',
+            'value_template': '{{ value_json.name }}',
+            'json_attributes_topic': f'{base}/last/vehicle',
+        }),
+        ('sensor', 'last_animal_event', {
+            'name': 'Last Animal Event', 'state_topic': f'{base}/last/animal',
+            'value_template': '{{ value_json.name }}',
+            'json_attributes_topic': f'{base}/last/animal',
+        }),
         ('binary_sensor', 'detector', {
             'name': 'Detector', 'state_topic': f'{base}/status',
             'value_template': "{{ 'ON' if value_json.yolo else 'OFF' }}",
@@ -407,12 +422,62 @@ def _recent_events_payload(limit=3):
         'ts': time.time(),
     }
 
+def _event_item(rec):
+    thumb = rec.get('thumbnail_url')
+    if not thumb and rec.get('video_url'):
+        thumb = rec.get('video_url').replace('event.mp4', 'best_frame.jpg')
+    return {
+        'track_id': rec.get('track_id'),
+        'cat': rec.get('cat'),
+        'name': rec.get('name') or rec.get('cat') or 'none',
+        'first_seen': rec.get('first_seen'),
+        'duration_s': rec.get('duration_s'),
+        'best_score': rec.get('best_score'),
+        'thumbnail_url': thumb,
+        'thumbnail_url_abs': _abs_url(thumb),
+        'video_url': rec.get('video_url'),
+        'video_url_abs': _abs_url(rec.get('video_url')),
+        'event_meta_url': rec.get('event_meta_url'),
+        'ts': time.time(),
+    }
+
+def _last_event_by_category_payload():
+    latest = {}
+    try:
+        if os.path.exists(EVENT_FILE):
+            with open(EVENT_FILE) as f:
+                lines = f.readlines()[-300:]
+            for line in lines:
+                try:
+                    rec = json.loads(line.strip())
+                except Exception:
+                    continue
+                cat = rec.get('cat')
+                if cat not in ('person', 'vehicle', 'animal'):
+                    continue
+                if not rec.get('video_url') and not rec.get('thumbnail_url'):
+                    continue
+                latest[cat] = _event_item(rec)
+    except Exception:
+        pass
+    empty = lambda cat: {
+        'cat': cat, 'name': 'none', 'thumbnail_url': '', 'thumbnail_url_abs': '',
+        'video_url': '', 'video_url_abs': '', 'ts': time.time(),
+    }
+    return {cat: latest.get(cat) or empty(cat) for cat in ('person', 'vehicle', 'animal')}
+
 def mqtt_publish_recent_events():
     mc = _mqtt_enabled_cfg()
     if not mc['enabled'] or not mc['host']:
         return
     mqtt_publish_discovery()
-    _mqtt_publish_many([(f"{mc['base']}/recent_events", _recent_events_payload(3), True)])
+    by_cat = _last_event_by_category_payload()
+    _mqtt_publish_many([
+        (f"{mc['base']}/recent_events", _recent_events_payload(3), True),
+        (f"{mc['base']}/last/person", by_cat['person'], True),
+        (f"{mc['base']}/last/vehicle", by_cat['vehicle'], True),
+        (f"{mc['base']}/last/animal", by_cat['animal'], True),
+    ])
 
 # ---- Point-in-polygon (ray casting) ----
 def pip(x, y, poly):
