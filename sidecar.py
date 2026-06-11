@@ -1015,6 +1015,9 @@ def _start_hls_ffmpeg():
     global _hls_proc
     if not HLS_ENABLED:
         return
+    with config_lock:
+        hls_fps = int(cfg.get('target_fps', 0) or 5)
+    hls_fps = max(1, min(hls_fps, 5))
     os.makedirs(HLS_DIR, exist_ok=True)
     if not os.path.exists(HLS_FIFO):
         os.mkfifo(HLS_FIFO)
@@ -1027,7 +1030,8 @@ def _start_hls_ffmpeg():
         _hls_proc = subprocess.Popen([
             'ffmpeg', '-y', '-loglevel', 'error',
             '-use_wallclock_as_timestamps', '1',
-            '-f', 'h264', '-i', HLS_FIFO,
+            '-fflags', '+genpts',
+            '-f', 'h264', '-r', str(hls_fps), '-i', HLS_FIFO,
             '-c:v', 'copy',
             '-f', 'hls',
             '-hls_time', '2',

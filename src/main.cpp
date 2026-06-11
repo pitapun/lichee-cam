@@ -708,7 +708,11 @@ int main(int argc, char *argv[]) {
     // throttled so JPEG encoding does not heat the SoC.
     cv::Mat prev_small;
     const bool ENABLE_HLS = true;
-    int hls_fps = (target_fps > 0) ? target_fps : 15;
+    // HLS must advertise a frame rate close to the frame cadence we can
+    // actually sustain. If this is higher than the real send rate, players
+    // fast-forward during playback because the H264 stream timestamps imply
+    // more frames per second than the pipeline produced.
+    int hls_fps = (target_fps > 0) ? std::min(target_fps, 5) : 5;
     long last_mjpeg_ms = 0;
     const long MJPEG_FORCE_MS = ENABLE_HLS ? 2000 : 500;
     const char *HD_RECORD_CONTROL = "/tmp/ninti_hd_record_dir";
