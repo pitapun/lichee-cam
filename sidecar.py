@@ -8,7 +8,7 @@ NintiDetect sidecar
   - Serves web UI on port 7778  (MJPEG still direct from :7777)
 """
 
-import json, os, shutil, subprocess, threading, time, socket, sys, io
+import json, os, shutil, subprocess, threading, time, socket, sys, io, collections
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from queue import Queue, Empty
@@ -74,12 +74,17 @@ latest_stream_jpg = None
 latest_stream_id = 0
 stream_clients = 0
 
+PRE_BUFFER_SECS = 2.0
+_pre_buf = collections.deque()  # (t, jpg_bytes) — rolling 3s window
+_pre_buf_lock = threading.Lock()
+
 TRACK_IOU_THRESHOLD = 0.20
 TRACK_CENTER_THRESHOLD = 0.25
 TRACK_CONFIRM_HITS = 2
 TRACK_LOST_TIMEOUT = 5.0    # object not detected for 5s -> gone
 TRACK_STILL_TIMEOUT = 5.0   # object not moving for 5s -> gone
 TRACK_MOVE_THRESHOLD = 0.04 # min center shift (normalised) to count as movement
+MIN_RECORD_SECS = 3.0       # minimum recording duration after confirmation
 
 cfg = DEFAULT_CONFIG.copy()
 if os.path.exists(CONFIG_FILE):
@@ -143,7 +148,7 @@ def _write_event(kind, tr, now):
             'name': tr.get('name'),
             'first_seen': tr.get('first_seen'),
             'last_seen': tr.get('last_seen'),
-            'duration_s': round(tr.get('last_seen', now) - tr.get('first_seen', now), 3),
+            'duration_s': round(now - tr.get('first_seen', now), 3),
             'hits': tr.get('hits', 0),
             'best_score': tr.get('best_score', 0),
             'bbox': tr.get('bbox'),
@@ -178,28 +183,44 @@ def _start_event_video(tr, now):
     with recorders_lock:
         if tid in event_recorders:
             return
-        _stop_hls_ffmpeg()
         os.makedirs(EVENT_DIR, exist_ok=True)
         stamp = int(now)
         tmp_dir = os.path.join(EVENT_DIR, f'.track_{tid:05d}_recording_{stamp}')
         frames_dir = os.path.join(tmp_dir, 'frames')
         os.makedirs(frames_dir, exist_ok=True)
         actual_fps = float(cfg.get('target_fps') or EVENT_VIDEO_FPS)
+
+        # Write pre-buffer frames (last PRE_BUFFER_SECS before trigger)
+        pre_idx = 0
+        pre_last_t = now - (1.0 / actual_fps)
+        with _pre_buf_lock:
+            cutoff = now - PRE_BUFFER_SECS
+            pre_frames = [(t, j) for (t, j) in _pre_buf if t >= cutoff]
+        for (t, jpg_bytes) in pre_frames:
+            path = os.path.join(frames_dir, f'frame_{pre_idx:05d}.jpg')
+            try:
+                with open(path, 'wb') as f:
+                    f.write(jpg_bytes)
+                pre_idx += 1
+                pre_last_t = t
+            except Exception as e:
+                print(f'[events] pre-buf write error: {e}', flush=True)
+
         event_recorders[tid] = {
             'track_id': tid,
             'tmp_dir': tmp_dir,
             'frames_dir': frames_dir,
-            'last_frame_t': now - (1.0 / actual_fps),
-            'frame_count': 0,
+            'last_frame_t': pre_last_t,
+            'frame_count': pre_idx,
             'fps': actual_fps,
-            'started_at': now,
+            'started_at': pre_frames[0][0] if pre_frames else now,
         }
         try:
             with open(HD_RECORD_CONTROL_FILE, 'w') as f:
                 f.write(frames_dir)
         except Exception as e:
             print(f'[events] hd control write error: {e}', flush=True)
-    print(f'[events] recording start track {tid}', flush=True)
+    print(f'[events] recording start track {tid} pre_buf={pre_idx}fr', flush=True)
 
 def _record_event_frame(jpg, now):
     if os.path.exists(HD_RECORD_CONTROL_FILE):
@@ -241,12 +262,23 @@ def _publish_stream_frame(jpg):
         latest_stream_id += 1
         stream_lock.notify_all()
 
+def _push_pre_buf(jpg, t):
+    with _pre_buf_lock:
+        _pre_buf.append((t, jpg))
+        cutoff = t - (PRE_BUFFER_SECS + 1.0)
+        while _pre_buf and _pre_buf[0][0] < cutoff:
+            _pre_buf.popleft()
+
 def _stream_interest():
     with stream_lock:
         clients = stream_clients
     if clients > 0:
         return True
-    return _has_event_recorders() and not os.path.exists(HD_RECORD_CONTROL_FILE)
+    if _has_event_recorders() and not os.path.exists(HD_RECORD_CONTROL_FILE):
+        return True
+    # Always maintain MJPEG connection while yolo_proc runs so pre-buffer stays filled
+    with yolo_lock:
+        return yolo_proc is not None
 
 def _disk_used_pct(path):
     os.makedirs(path, exist_ok=True)
@@ -336,10 +368,10 @@ def _run_ffmpeg(frames_dir, out_mp4, fps, h264_in=None):
     if h264_in and os.path.exists(h264_in):
         cmds = [
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
-             '-r', rfps, '-i', h264_in, '-c:v', 'copy',
+             '-framerate', rfps, '-i', h264_in, '-c:v', 'copy',
              '-metadata:s:v:0', 'rotate=180', out_mp4],
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
-             '-r', rfps, '-i', h264_in, '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p',
+             '-framerate', rfps, '-i', h264_in, '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p',
              '-metadata:s:v:0', 'rotate=180', out_mp4],
         ]
         for cmd in cmds:
@@ -385,8 +417,6 @@ def _finish_event_video(tr, save, now):
             if active_dir == rec.get('frames_dir'):
                 os.unlink(HD_RECORD_CONTROL_FILE)
                 _wait_hd_record_done(rec.get('frames_dir'))
-                if HLS_ENABLED:
-                    threading.Thread(target=_start_hls_ffmpeg, daemon=True).start()
     except Exception:
         pass
     tmp_dir = rec['tmp_dir']
@@ -462,7 +492,7 @@ def _expire_tracks(now=None):
         for tid, tr in list(tracks.items()):
             lost  = now - tr.get('last_seen',  now) > TRACK_LOST_TIMEOUT
             still = now - tr.get('last_moved', now) > TRACK_STILL_TIMEOUT
-            if lost or still:
+            if (lost or still) and now >= tr.get('min_record_until', 0):
                 expired.append(tid)
         for tid in expired:
             tr = tracks.pop(tid, {})
@@ -548,6 +578,7 @@ def _update_track(det):
         if not tr.get('confirmed') and tr['hits'] >= TRACK_CONFIRM_HITS:
             tr['confirmed'] = True
             _start_event_video(tr, now)
+            tr['min_record_until'] = now + MIN_RECORD_SECS
 
         det['track_id'] = best_id
         det['track_hits'] = tr['hits']
@@ -581,7 +612,7 @@ def _stop_rtsp():
 # ---- HLS ffmpeg lifecycle ----
 HLS_FIFO = '/tmp/hls_feed.h264'
 HLS_DIR  = '/tmp/hls'
-HLS_ENABLED = False
+HLS_ENABLED = True
 _hls_proc = None
 _hls_lock = threading.Lock()
 
@@ -592,18 +623,21 @@ def _start_hls_ffmpeg():
     os.makedirs(HLS_DIR, exist_ok=True)
     if not os.path.exists(HLS_FIFO):
         os.mkfifo(HLS_FIFO)
-    time.sleep(4)  # wait for stream_yolo to open the FIFO (O_RDWR)
+    time.sleep(1)
     with _hls_lock:
         if _hls_proc and _hls_proc.poll() is None:
-            return
+            _hls_proc.terminate()
+            try: _hls_proc.wait(3)
+            except: _hls_proc.kill()
         _hls_proc = subprocess.Popen([
             'ffmpeg', '-y', '-loglevel', 'error',
-            '-f', 'h264', '-r', '25', '-i', HLS_FIFO,
+            '-use_wallclock_as_timestamps', '1',
+            '-f', 'h264', '-i', HLS_FIFO,
             '-c:v', 'copy',
             '-f', 'hls',
             '-hls_time', '2',
             '-hls_list_size', '5',
-            '-hls_flags', 'delete_segments+append_list+omit_endlist',
+            '-hls_flags', 'delete_segments+append_list+omit_endlist+split_by_time',
             f'{HLS_DIR}/live.m3u8',
         ], stdout=subprocess.DEVNULL, stderr=open('/tmp/hls_ffmpeg.log', 'w'))
         print(f'[hls] ffmpeg started pid={_hls_proc.pid}')
@@ -667,9 +701,7 @@ def _start_yolo_inner():
                 size = int(z.get('size', INFER_SIZE))
             except Exception:
                 continue
-            size = max(INFER_SIZE, min(size, min(sw, sh)))
-            x = max(0, min(x, sw - size))
-            y = max(0, min(y, sh - size))
+            size = max(INFER_SIZE, size)  # enforce minimum only; zone may exceed frame
             clamped.append((x, y, size))
         args = [STREAM_BIN, MODEL, '80', str(INFER_SIZE), thresh,
                 str(UDP_PORT), str(sw), str(sh)]
@@ -685,6 +717,7 @@ def _start_yolo_inner():
         print(f'[yolo] starting threshold={thresh} sensor={sw}x{sh} '
               f'zones={clamped} active={cfg.get("active_detector",False)} '
               f'fps_cap={tfps or "off"}')
+        _stop_hls_ffmpeg()
         yolo_log = open('/tmp/stream_yolo.log', 'w')
         yolo_proc = subprocess.Popen(args, env=env, stdout=yolo_log, stderr=yolo_log)
         if HLS_ENABLED:
@@ -786,6 +819,7 @@ def _motion_detector():
                     try:
                         now_t = time.time()
                         _publish_stream_frame(jpg)
+                        _push_pre_buf(jpg, now_t)
                         _record_event_frame(jpg, now_t)
                         with config_lock:
                             motion_on  = cfg.get('motion_enabled', True)
@@ -908,7 +942,8 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 .panel-head{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:4px;margin-bottom:10px;letter-spacing:.1em;text-transform:uppercase}
 #stream-area{flex:1;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}
 #stream{display:block;width:100%;height:100%;object-fit:contain;image-rendering:pixelated}
-#hlsPlayer{display:none;width:100%;transform:rotate(180deg)}
+#hlsPlayer{display:none;width:100%;height:100%;object-fit:contain}
+#hlsCanvas{display:none;width:100%;height:100%}
 #overlay{position:absolute;cursor:crosshair}
 #stream-btns{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);display:flex;gap:6px}
 
@@ -1060,9 +1095,11 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
 
   <div id="stream-area">
     <img id="stream" src="" alt="stream offline">
-    <video id="hlsPlayer" muted autoplay playsinline></video>
+    <video id="hlsPlayer" muted autoplay playsinline style="display:none"></video>
+    <canvas id="hlsCanvas" style="display:none;width:100%;height:100%;object-fit:contain"></canvas>
     <canvas id="overlay"></canvas>
     <div id="stream-btns">
+      <button onclick="setStream('hls')"   id="btnHls">HLS</button>
       <button onclick="setStream('mjpeg')" id="btnMjpeg">MJPEG</button>
     </div>
   </div>
@@ -1146,6 +1183,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
         <option value="1920,1080">1920 x 1080 (HD)</option>
         <option value="2560,1440">2560 x 1440 (QHD)</option>
       </select>
+      <button onclick="rebootDevice()" style="margin-left:6px">Reboot</button>
     </div>
     <div class="s-row">
       <span class="s-label">FPS cap</span>
@@ -1199,6 +1237,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   <span id="stRtsp"></span>
 </div>
 
+<script src="/hls.min.js"></script>
 <script>
 const PALETTE=['#f55','#5af','#5f5','#fa5','#a5f','#ff5','#5ff'];
 const INFER_SZ=640; const MAX_DET_ZONES=4;
@@ -1218,6 +1257,8 @@ let es=null;
 let pendingMode='ninti';
 let dzDrag=null;  // {idx,offX,offY} during detection-zone drag
 let eventPlaybackTimer=null;
+var _hlsObj=null;
+var _streamMode='mjpeg';
 
 const streamEl=document.getElementById('stream');
 const cvs=document.getElementById('overlay');
@@ -1231,12 +1272,12 @@ function getip(){return document.getElementById('ip').value.trim()||location.hos
 
 function connect(){
   ip=getip();
-  streamEl.src='http://'+ip+':7778/stream';
   loadConf();
   loadEvents();
   openSSE();
   pollStatus();
   setInterval(loadEvents, 5000);
+  setStream('hls');
 }
 
 function loadConf(){
@@ -1349,12 +1390,13 @@ function playEventFrames(e){
   const player=document.getElementById('eventPlayer');
   player.pause();
   player.style.display='none';
+  // Prefer mp4 when available; JPEG slideshow is fallback only
+  if(e.video_url){playEventMp4(e.video_url);return;}
   const framePlayer=document.getElementById('eventFramePlayer');
-  const framesUrl=e.frames_url || (e.event_dir ? e.event_dir+'/frames/' : (e.video_url ? e.video_url.replace(/event\\.mp4$/, 'frames/') : ''));
+  const framesUrl=e.frames_url || (e.event_dir ? e.event_dir+'/frames/' : '');
   const n=parseInt(e.num_frames||0);
   const fps=parseFloat(e.record_fps||25);
   if(!framesUrl || !n){
-    playEventMp4(e.video_url);
     return;
   }
   let idx=0;
@@ -1576,9 +1618,12 @@ function onDiscard(d){
 
 // Canvas
 function syncCvs(){
-  const lr=streamEl.getBoundingClientRect();
-  const pr=streamEl.parentElement.getBoundingClientRect();
-  const nw=streamEl.naturalWidth||640, nh=streamEl.naturalHeight||360;
+  const hlsEl=document.getElementById('hlsPlayer');
+  const activeEl=(_streamMode==='hls'&&hlsEl.videoWidth)?hlsEl:streamEl;
+  const lr=activeEl.getBoundingClientRect();
+  const pr=activeEl.parentElement.getBoundingClientRect();
+  const nw=(activeEl===hlsEl?hlsEl.videoWidth:activeEl.naturalWidth)||640;
+  const nh=(activeEl===hlsEl?hlsEl.videoHeight:activeEl.naturalHeight)||360;
   // compute actual rendered rect (object-fit:contain inside lr)
   const scale=Math.min(lr.width/nw, lr.height/nh);
   const rw=nw*scale, rh=nh*scale;
@@ -1591,6 +1636,7 @@ function syncCvs(){
   cvs.style.height=rh+'px';
 }
 streamEl.onload=syncCvs;
+document.getElementById('hlsPlayer').addEventListener('loadedmetadata',syncCvs);
 window.addEventListener('resize',syncCvs);
 
 // stream_yolo emits UDP coordinates in the same rotated space as the MJPEG frame.
@@ -1664,16 +1710,12 @@ window.addEventListener('mousemove',e=>{
   const sw=cfg.sensor_width, sh=cfg.sensor_height;
   const z=cfg.detection_zones[dzDrag.idx];
   if(dzDrag.mode==='resize'){
-    // New size = distance from zone origin to cursor (cap by frame).
     let ns=Math.round(Math.min(px-z.x, py-z.y));
-    ns=Math.max(INFER_SZ, Math.min(ns, sw-z.x, sh-z.y));
+    ns=Math.max(INFER_SZ, ns);  // minimum size only; may exceed frame
     z.size=ns;
   } else {
-    const s=zoneSize(z);
     let nx=Math.round(px-dzDrag.offX), ny=Math.round(py-dzDrag.offY);
-    nx=Math.max(0,Math.min(nx,sw-s));
-    ny=Math.max(0,Math.min(ny,sh-s));
-    z.x=nx; z.y=ny;
+    z.x=nx; z.y=ny;  // no frame-bound clamping; zone may extend beyond image
   }
   dzDrag.dragged=true;
   renderDzList();
@@ -1747,9 +1789,7 @@ function applyAll(){
   cfg.sensor_height=parseInt(sr[1]);
   const sw=cfg.sensor_width, sh=cfg.sensor_height;
   (cfg.detection_zones||[]).forEach(z=>{
-    z.size=Math.max(INFER_SZ,Math.min(z.size||INFER_SZ,sw,sh));
-    z.x=Math.max(0,Math.min(z.x,sw-z.size));
-    z.y=Math.max(0,Math.min(z.y,sh-z.size));
+    z.size=Math.max(INFER_SZ,z.size||INFER_SZ);  // minimum size only; zone may exceed frame
   });
   cfg.target_fps=parseInt(document.getElementById('fpsCap').value);
   cfg.threshold=parseFloat(document.getElementById('th').value);
@@ -1759,10 +1799,10 @@ function applyAll(){
   btns.forEach(b=>{b.disabled=true;b.textContent='Applying...';});
   fetch('http://'+ip+':7778/api/config',{
     method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({...cfg,_restart:true})
+    body:JSON.stringify(cfg)
   }).then(()=>{
     dzCfgDirty=false;
-    setStatus('Applied & restarting...');
+    setStatus('Saved. Reboot to apply hardware changes.');
     btns.forEach(b=>{b.disabled=false;b.textContent='Apply';});
   }).catch(e=>{
     setStatus(''+e);
@@ -1898,6 +1938,12 @@ function toggleClass(c,on){
   if(!on)cfg.filter_classes=cfg.filter_classes.filter(x=>x!==c);
 }
 
+function rebootDevice(){
+  if(!confirm('Reboot device?')) return;
+  fetch('http://'+getip()+':7778/api/reboot',{method:'POST'})
+    .then(()=>setStatus('Rebooting... (~45s)'))
+    .catch(()=>setStatus('Rebooting...'));
+}
 function setStatus(msg){
   document.getElementById('status').textContent=msg;
   if(msg)setTimeout(()=>{if(document.getElementById('status').textContent===msg)
@@ -1905,20 +1951,29 @@ function setStatus(msg){
 }
 
 function showMainTab(name, btn){
+  const wasLive = document.getElementById('main-live').classList.contains('active');
   document.querySelectorAll('.nav-tab').forEach(b=>b.classList.remove('active'));
   document.querySelectorAll('.main-tab').forEach(p=>p.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('main-'+name).classList.add('active');
   if(name==='events') loadEvents();
+  // leaving live tab: tear down HLS so buffer doesn't accumulate
+  if(wasLive && name!=='live' && _streamMode==='hls') {
+    if(_hlsObj){ _hlsObj.destroy(); _hlsObj=null; }
+    const hlsEl=document.getElementById('hlsPlayer');
+    hlsEl.pause(); hlsEl.src='';
+  }
+  // returning to live tab: restart HLS fresh from live edge
+  if(!wasLive && name==='live' && _streamMode==='hls') {
+    setStream('hls');
+  }
 }
 
 if(document.getElementById('ip').value) connect();
 
-// ---- HLS player ----
-let _hlsObj = null;
-let _streamMode = 'mjpeg';
+// ---- HLS player (rotation handled by VPSS hardware: bMirror+bFlip in capture_cvi.cpp) ----
 function setStream(mode) {
-  const ip = document.getElementById('ip').value.trim();
+  const ip      = document.getElementById('ip').value.trim();
   const mjpegEl = document.getElementById('stream');
   const hlsEl   = document.getElementById('hlsPlayer');
   _streamMode = mode;
@@ -1926,14 +1981,20 @@ function setStream(mode) {
     mjpegEl.src = ''; mjpegEl.style.display = 'none';
     hlsEl.style.display = 'block';
     const hlsUrl = 'http://' + ip + ':7778/hls/live.m3u8';
-    if (hlsEl.canPlayType('application/vnd.apple.mpegurl')) {
-      hlsEl.src = hlsUrl; hlsEl.play();
-    } else if (window.Hls && Hls.isSupported()) {
+    if (window.Hls && Hls.isSupported()) {
       if (_hlsObj) _hlsObj.destroy();
-      _hlsObj = new Hls({lowLatencyMode: true});
+      _hlsObj = new Hls({
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 6,
+        maxBufferLength: 20,
+        maxMaxBufferLength: 20,
+        lowLatencyMode: false,
+      });
       _hlsObj.loadSource(hlsUrl);
       _hlsObj.attachMedia(hlsEl);
-      _hlsObj.on(Hls.Events.MANIFEST_PARSED, () => hlsEl.play());
+      _hlsObj.on(Hls.Events.MANIFEST_PARSED, () => hlsEl.play().catch(()=>{}));
+    } else if (hlsEl.canPlayType('application/vnd.apple.mpegurl')) {
+      hlsEl.src = hlsUrl; hlsEl.play().catch(()=>{});
     }
   } else {
     if (_hlsObj) { _hlsObj.destroy(); _hlsObj = null; }
@@ -1943,7 +2004,6 @@ function setStream(mode) {
   }
 }
 </script>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 </body>
 </html>'''
 
@@ -2025,8 +2085,25 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith('/event-video/'):
             self._serve_event_file(path, head_only=True)
+        elif path in ('/', '/index.html', '/api/status', '/api/config', '/api/events'):
+            self.send_response(200)
+            self._cors()
+            self.end_headers()
+        elif path.startswith('/hls/'):
+            rel = path[len('/hls/'):]
+            rel = os.path.normpath(rel).lstrip('/')
+            full = os.path.abspath(os.path.join('/tmp/hls', rel))
+            if not full.startswith('/tmp/hls') or not os.path.exists(full):
+                self.send_response(404); self.end_headers(); return
+            ctype = 'application/vnd.apple.mpegurl' if full.endswith('.m3u8') else 'video/MP2T'
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', os.path.getsize(full))
+            self.send_header('Cache-Control', 'no-cache')
+            self._cors()
+            self.end_headers()
         else:
-            self.send_response(404)
+            self.send_response(200)
             self.end_headers()
 
     def do_GET(self):
@@ -2093,6 +2170,18 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path.startswith('/event-video/'):
             self._serve_event_file(path)
+
+        elif path == '/hls.min.js':
+            hls_js = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hls.min.js')
+            if not os.path.exists(hls_js):
+                self.send_response(404); self.end_headers(); return
+            data = open(hls_js, 'rb').read()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/javascript')
+            self.send_header('Content-Length', len(data))
+            self.send_header('Cache-Control', 'public, max-age=86400')
+            self.end_headers()
+            self.wfile.write(data)
 
         elif path.startswith('/hls/'):
             rel = path[len('/hls/'):]
@@ -2197,6 +2286,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 self.wfile.write(str(e).encode())
+
+        elif path == '/api/reboot':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+            threading.Thread(target=lambda: (__import__('time').sleep(0.3), __import__('subprocess').call(['reboot'])), daemon=True).start()
 
         elif path == '/api/shutdown':
             # Gracefully stop stream_yolo (allows VPSS teardown) then exit.

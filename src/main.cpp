@@ -5,6 +5,7 @@
 #include "MJPEGWriter.h"
 #include "yolo.hpp"
 #include "cvi_venc.h"
+#include "cvi_sys.h"
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#include <atomic>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -24,7 +26,10 @@
 #include <opencv2/highgui/highgui.hpp>
 
 volatile uint8_t interrupted = 0;
-void interrupt_handler(int signum) { interrupted = 1; }
+void interrupt_handler(int signum) {
+    if (signum == SIGTERM) _exit(0);  // fast exit: kernel closes CVI fds, avoids D-state in driver cleanup
+    interrupted = 1;
+}
 
 // Global camera pointer for crash-cleanup (avoids VPSS leak on segfault)
 static cv::VideoCapture *g_cap = nullptr;
@@ -135,31 +140,120 @@ static void hd_enqueue_done(const std::string &dir) {
     hd_queue_cv.notify_one();
 }
 
+// HlsStreamer: encodes frames via CHN0 VENC and writes Annex-B H264 to a FIFO
+// for ffmpeg to segment into HLS.  Drain is synchronous (called inside send())
+// so GetStream always runs right after SendFrame — eliminating the BUF_EMPTY
+// race that plagued the old drain_loop thread.
 class HlsStreamer {
 public:
-    HlsStreamer() : active(false), chn(2), running(false) {}
+    HlsStreamer() : active(false), chn(0), fd(-1), stream_started(false),
+                    idr_pending(false), venc_active(false),
+                    saved_w(0), saved_h(0), saved_fps(0), drain_requested_(false) {}
 
     bool start(int w, int h, int fps) {
+        // cap HLS at 1280x720 — CHN0 is live-view only; high-res uses CHN1
+        if (w > 1280 || h > 720) { w = 1280; h = 720; }
+        saved_w = w; saved_h = h; saved_fps = fps;
+
+        static const char* FIFO = "/tmp/hls_feed.h264";
+        while (fd < 0) {
+            fd = open(FIFO, O_RDWR | O_NONBLOCK);
+            if (fd < 0) usleep(200000);
+        }
+        fcntl(fd, F_SETPIPE_SZ, 1024 * 1024);
+        { char tmp[4096]; while (read(fd, tmp, sizeof(tmp)) > 0) {} }  // flush stale
+
+        CVI_VENC_StopRecvFrame(chn);
+        CVI_VENC_DestroyChn(chn);
+        if (!create_and_start_venc()) { close(fd); fd = -1; return false; }
+
+        usleep(50000);  // 50ms: let encoder thread initialize before first SendFrame
+        CVI_VENC_RequestIDR(chn, CVI_FALSE);
+        active = true;
+        if (!drain_thr_.joinable())
+            drain_thr_ = std::thread([this]{ drain_thread_fn(); });
+        fprintf(stderr, "[hls] started %dx%d@%d\n", w, h, fps);
+        return true;
+    }
+
+    void pause_venc() {
+        if (!venc_active) return;
+        venc_active = false;
+        drain_cv_.notify_all();  // wake drain thread so it sees venc_active=false
+        usleep(60000);           // 60ms >> 5ms poll interval — drain exits cleanly
+        fprintf(stderr, "[hls] pause CHN0\n");
+        CVI_VENC_StopRecvFrame(chn);
+        CVI_VENC_DestroyChn(chn);
+    }
+
+    void resume_venc() {
+        if (venc_active) return;
+        fprintf(stderr, "[hls] resume CHN0\n");
+        if (!create_and_start_venc()) { fprintf(stderr, "[hls] resume failed\n"); return; }
+        idr_pending = true;
+    }
+
+    void send(VIDEO_FRAME_INFO_S* frame) {
+        if (!active || !frame || !venc_active) return;
+        // Skip if drain thread hasn't caught up — avoids VENC queue overflow
+        if (drain_requested_.load()) return;
+        if (idr_pending.exchange(false)) {
+            CVI_VENC_RequestIDR(chn, CVI_FALSE);
+            fprintf(stderr, "[hls] IDR requested (resume)\n");
+        }
+        static int send_count = 0;
+        long sf_t0 = now_ms();
+        CVI_S32 ret = CVI_VENC_SendFrame(chn, frame, 100);
+        long sf_ms = now_ms() - sf_t0;
+        if (ret == CVI_SUCCESS || ret == CVI_TRUE) {
+            if (++send_count <= 10 || send_count % 50 == 0)
+                fprintf(stderr, "[hls] SendFrame ok #%d (ret=%d sf=%ldms)\n", send_count, ret, sf_ms);
+            drain_requested_ = true;
+            drain_cv_.notify_one();
+        } else {
+            fprintf(stderr, "[hls] SendFrame failed %#x\n", ret);
+        }
+    }
+
+    void stop() {
+        if (!active) return;
+        active = false;
+        drain_cv_.notify_all();
+        if (drain_thr_.joinable()) drain_thr_.join();
+        CVI_VENC_StopRecvFrame(chn);
+        CVI_VENC_DestroyChn(chn);
+        if (fd >= 0) { close(fd); fd = -1; }
+        fprintf(stderr, "[hls] stopped\n");
+    }
+
+    bool is_active() const { return active; }
+    bool is_venc_active() const { return venc_active.load(); }
+    bool is_drain_requested() const { return drain_requested_.load(); }
+    VENC_CHN get_chn() const { return chn; }
+    int get_w() const { return saved_w; }
+    int get_h() const { return saved_h; }
+
+private:
+    bool create_and_start_venc() {
         VENC_CHN_ATTR_S attr;
         memset(&attr, 0, sizeof(attr));
         attr.stVencAttr.enType = PT_H264;
-        attr.stVencAttr.u32MaxPicWidth = w;
-        attr.stVencAttr.u32MaxPicHeight = h;
-        attr.stVencAttr.u32PicWidth = w;
-        attr.stVencAttr.u32PicHeight = h;
-        attr.stVencAttr.u32BufSize = w * h;
+        attr.stVencAttr.u32MaxPicWidth = saved_w;
+        attr.stVencAttr.u32MaxPicHeight = saved_h;
+        attr.stVencAttr.u32PicWidth = saved_w;
+        attr.stVencAttr.u32PicHeight = saved_h;
+        attr.stVencAttr.u32BufSize = saved_w * saved_h * 2;
         attr.stVencAttr.u32Profile = 2;
         attr.stVencAttr.bByFrame = CVI_TRUE;
         attr.stVencAttr.stAttrH264e.bRcnRefShareBuf = CVI_FALSE;
         attr.stRcAttr.enRcMode = VENC_RC_MODE_H264CBR;
-        attr.stRcAttr.stH264Cbr.u32Gop = fps;
+        attr.stRcAttr.stH264Cbr.u32Gop = saved_fps;  // IDR every ~1s at target fps
         attr.stRcAttr.stH264Cbr.u32StatTime = 1;
-        attr.stRcAttr.stH264Cbr.u32SrcFrameRate = fps;
-        attr.stRcAttr.stH264Cbr.fr32DstFrameRate = fps;
-        attr.stRcAttr.stH264Cbr.u32BitRate = (w >= 1920) ? 3000 : 1500;
+        attr.stRcAttr.stH264Cbr.u32SrcFrameRate = saved_fps;
+        attr.stRcAttr.stH264Cbr.fr32DstFrameRate = saved_fps;
+        attr.stRcAttr.stH264Cbr.u32BitRate = (saved_w >= 1920) ? 3000 : 1500;
         attr.stGopAttr.enGopMode = VENC_GOPMODE_NORMALP;
         attr.stGopAttr.stNormalP.s32IPQpDelta = 2;
-
         if (CVI_VENC_CreateChn(chn, &attr) != CVI_SUCCESS) {
             fprintf(stderr, "[hls] CreateChn failed\n");
             return false;
@@ -171,125 +265,117 @@ public:
             CVI_VENC_DestroyChn(chn);
             return false;
         }
-        active = true;
-        running = true;
-        drain_th = std::thread(&HlsStreamer::drain_loop, this);
-        fprintf(stderr, "[hls] streamer started %dx%d@%d\n", w, h, fps);
+        venc_active = true;
         return true;
     }
 
-    void send(VIDEO_FRAME_INFO_S* frame) {
-        if (!active || !frame) return;
-        CVI_S32 ret = CVI_VENC_SendFrame(chn, frame, 100);
-        if (ret != CVI_SUCCESS)
-            fprintf(stderr, "[hls] SendFrame failed %#x\n", ret);
-    }
-
-    void stop() {
-        if (!active && !running) return;
-        fprintf(stderr, "[hls] stopping streamer\n");
-        running = false;
-        active = false;
-        CVI_VENC_StopRecvFrame(chn);
-        if (drain_th.joinable()) drain_th.join();
-        CVI_VENC_DestroyChn(chn);
-        fprintf(stderr, "[hls] streamer stopped\n");
-    }
-
-    bool is_active() const { return active; }
-
-private:
-    void drain_loop() {
-        static const char* FIFO = "/tmp/hls_feed.h264";
-        // Open O_RDWR so the FIFO is always "alive" (never sends EOF to readers
-        // when ffmpeg dies and reconnects). O_NONBLOCK avoids blocking on open.
-        // Then remove O_NONBLOCK so subsequent writes are blocking (back-pressure).
-        int fd = -1;
-        while (running && fd < 0) {
-            fd = open(FIFO, O_RDWR | O_NONBLOCK);
-            if (fd < 0) { usleep(200000); }
-        }
-        if (fd < 0) return;
-        // Switch to blocking writes; increase pipe buffer for ~2s buffering.
-        int fl = fcntl(fd, F_GETFL);
-        fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-        fcntl(fd, F_SETPIPE_SZ, 1024 * 1024);
-        fprintf(stderr, "[hls] fifo open (rdwr, blocking)\n");
-
-        // Flush stale ring-buffer packs accumulated before ffmpeg connected.
-        // Then force an IDR so ffmpeg sees a clean SPS+PPS+IDR at the very
-        // start of its read — without this the stream has no parameter sets.
-        for (int i = 0; i < 200; i++) {
-            VENC_CHN_STATUS_S s; memset(&s, 0, sizeof(s));
-            if (CVI_VENC_QueryStatus(chn, &s) != CVI_SUCCESS || s.u32CurPacks == 0) break;
-            VENC_STREAM_S st; memset(&st, 0, sizeof(st));
-            st.u32PackCount = s.u32CurPacks;
-            st.pstPack = (VENC_PACK_S*)calloc(s.u32CurPacks, sizeof(VENC_PACK_S));
-            if (!st.pstPack) break;
-            CVI_VENC_GetStream(chn, &st, 100);
-            CVI_VENC_ReleaseStream(chn, &st);
-            free(st.pstPack);
-        }
-        CVI_VENC_RequestIDR(chn, CVI_TRUE);
-        fprintf(stderr, "[hls] flushed stale packs, IDR requested\n");
-
-        // CVI VENC emits SPS+PPS only on the first IDR (not on subsequent ones).
-        // Store them here and prepend before every IDR so ffmpeg can sync after
-        // any reconnect within at most one GOP period.
-        std::vector<uint8_t> sps_nalu, pps_nalu;
-
-        while (running) {
-            VENC_CHN_STATUS_S status;
-            memset(&status, 0, sizeof(status));
-            CVI_S32 qs = CVI_VENC_QueryStatus(chn, &status);
-            if (qs != CVI_SUCCESS) { usleep(50000); continue; }
-            if (status.u32CurPacks == 0) { usleep(10000); continue; }
-            VENC_STREAM_S stream;
-            memset(&stream, 0, sizeof(stream));
-            stream.u32PackCount = status.u32CurPacks;
-            stream.pstPack = (VENC_PACK_S*)calloc(status.u32CurPacks, sizeof(VENC_PACK_S));
-            if (!stream.pstPack) { usleep(10000); continue; }
-            if (CVI_VENC_GetStream(chn, &stream, 1000) == CVI_SUCCESS) {
-                for (CVI_U32 i = 0; i < stream.u32PackCount; i++) {
-                    VENC_PACK_S* p = &stream.pstPack[i];
-                    uint8_t* d = p->pu8Addr + p->u32Offset;
-                    ssize_t sz = (ssize_t)(p->u32Len - p->u32Offset);
-                    uint8_t nalu = (sz >= 5) ? (d[4] & 0x1f) : 0;
-                    if (nalu == 7) {  // SPS
-                        sps_nalu.assign(d, d + sz);
-                    } else if (nalu == 8) {  // PPS
-                        pps_nalu.assign(d, d + sz);
-                    } else if (nalu == 5 && !sps_nalu.empty() && !pps_nalu.empty()) {
-                        // IDR: prepend stored SPS+PPS so every IDR boundary is self-contained
-                        write(fd, sps_nalu.data(), sps_nalu.size());
-                        write(fd, pps_nalu.data(), pps_nalu.size());
-                    }
-                    write(fd, d, sz);
-                }
-                CVI_VENC_ReleaseStream(chn, &stream);
+    void fifo_write(const uint8_t* d, ssize_t sz) {
+        if (fd < 0 || sz <= 0) return;
+        ssize_t n = write(fd, d, sz);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // FIFO full — ffmpeg likely dead. Drain pipe and reset stream so the
+            // next reconnect starts from a clean IDR.
+            char buf[4096];
+            while (read(fd, buf, sizeof(buf)) > 0) {}
+            if (stream_started) {
+                fprintf(stderr, "[hls] FIFO full — drained, reset stream\n");
+                stream_started = false;
             }
-            free(stream.pstPack);
         }
-        close(fd);
     }
 
-    bool active, running;
+    void drain(int timeout_ms) {
+        if (!venc_active || fd < 0) return;
+        VENC_CHN_STATUS_S status;
+        memset(&status, 0, sizeof(status));
+        long deadline = now_ms() + timeout_ms;
+        do {
+            if (!venc_active) return;  // channel destroyed mid-poll
+            if (CVI_VENC_QueryStatus(chn, &status) == CVI_SUCCESS
+                    && status.u32CurPacks > 0) break;
+            if (timeout_ms <= 0) return;
+            usleep(5000);
+        } while (now_ms() < deadline);
+        if (!venc_active || status.u32CurPacks == 0) return;
+
+        VENC_STREAM_S stream;
+        memset(&stream, 0, sizeof(stream));
+        stream.u32PackCount = status.u32CurPacks;
+        stream.pstPack = (VENC_PACK_S*)calloc(status.u32CurPacks, sizeof(VENC_PACK_S));
+        if (!stream.pstPack) return;
+
+        if (CVI_VENC_GetStream(chn, &stream, timeout_ms) == CVI_SUCCESS) {
+            for (CVI_U32 i = 0; i < stream.u32PackCount; i++) {
+                VENC_PACK_S* p = &stream.pstPack[i];
+                uint8_t* d = p->pu8Addr + p->u32Offset;
+                ssize_t sz = (ssize_t)(p->u32Len - p->u32Offset);
+                H264E_NALU_TYPE_E nalu = p->DataType.enH264EType;
+                if (nalu == H264E_NALU_SPS) {
+                    sps_nalu.assign(d, d + sz);
+                } else if (nalu == H264E_NALU_PPS) {
+                    pps_nalu.assign(d, d + sz);
+                } else if (nalu == H264E_NALU_IDRSLICE
+                           && !sps_nalu.empty() && !pps_nalu.empty()) {
+                    if (!stream_started) {
+                        stream_started = true;
+                        fprintf(stderr, "[hls] first IDR — stream started\n");
+                    }
+                    fifo_write(sps_nalu.data(), sps_nalu.size());
+                    fifo_write(pps_nalu.data(), pps_nalu.size());
+                    fifo_write(d, sz);
+                } else if (stream_started) {
+                    fifo_write(d, sz);
+                }
+            }
+            CVI_VENC_ReleaseStream(chn, &stream);
+        }
+        free(stream.pstPack);
+    }
+
+    void drain_thread_fn() {
+        long idr_last_ms = 0;
+        while (active) {
+            {
+                std::unique_lock<std::mutex> lk(drain_mtx_);
+                drain_cv_.wait(lk, [this]{ return drain_requested_.load() || !active; });
+                if (!active) break;
+                // Keep drain_requested_=true during drain so main loop doesn't send
+                // another frame while the encoder is still processing the current one
+                // (would cause NOBUF). Cleared after drain completes below.
+            }
+            drain(500);
+            drain_requested_ = false;  // allow main loop to send next frame
+            // Request IDR here (VENC idle after drain) — avoids blocking main thread
+            if (venc_active) {
+                long now_t = now_ms();
+                if (now_t - idr_last_ms >= 2000) {
+                    CVI_VENC_RequestIDR(chn, CVI_FALSE);
+                    idr_last_ms = now_t;
+                }
+            }
+        }
+    }
+
+    bool active, stream_started;
     VENC_CHN chn;
-    std::thread drain_th;
+    int fd;
+    std::atomic<bool> idr_pending;
+    std::atomic<bool> venc_active;
+    std::vector<uint8_t> sps_nalu, pps_nalu;
+    int saved_w, saved_h, saved_fps;
+    std::thread drain_thr_;
+    std::mutex drain_mtx_;
+    std::condition_variable drain_cv_;
+    std::atomic<bool> drain_requested_;
 };
 
 class H264Recorder {
 public:
-    H264Recorder() : active(false), chn(1), fp(nullptr), frames(0) {}
+    H264Recorder() : active(false), chn_ready(false), chn(1), fp(nullptr), frames(0) {}
 
-    bool start(const std::string& path, int w, int h, int fps) {
-        stop();
-        FILE* f = fopen(path.c_str(), "wb");
-        if (!f) {
-            fprintf(stderr, "[venc] fopen failed %s\n", path.c_str());
-            return false;
-        }
-
+    // Call once at startup to pre-create CHN1 so start() never destroy/creates mid-run.
+    bool init(int w, int h, int fps) {
+        if (chn_ready) return true;
         VENC_CHN_ATTR_S attr;
         memset(&attr, 0, sizeof(attr));
         attr.stVencAttr.enType = PT_H264;
@@ -309,23 +395,46 @@ public:
         attr.stRcAttr.stH264Cbr.u32BitRate = (w >= 1920) ? 6000 : 3000;
         attr.stGopAttr.enGopMode = VENC_GOPMODE_NORMALP;
         attr.stGopAttr.stNormalP.s32IPQpDelta = 2;
-
-        CVI_S32 ret = CVI_VENC_CreateChn(chn, &attr);
-        if (ret != CVI_SUCCESS) {
-            fprintf(stderr, "[venc] CreateChn failed %#x\n", ret);
-            fclose(f);
-            return false;
+        // Try to create directly; if channel already exists, destroy first.
+        if (CVI_VENC_CreateChn(chn, &attr) != CVI_SUCCESS) {
+            CVI_VENC_StopRecvFrame(chn);
+            CVI_VENC_DestroyChn(chn);
+            if (CVI_VENC_CreateChn(chn, &attr) != CVI_SUCCESS) {
+                fprintf(stderr, "[venc] init CreateChn failed\n");
+                return false;
+            }
         }
         VENC_RECV_PIC_PARAM_S recv;
         memset(&recv, 0, sizeof(recv));
         recv.s32RecvPicNum = -1;
-        ret = CVI_VENC_StartRecvFrame(chn, &recv);
-        if (ret != CVI_SUCCESS) {
-            fprintf(stderr, "[venc] StartRecvFrame failed %#x\n", ret);
+        if (CVI_VENC_StartRecvFrame(chn, &recv) != CVI_SUCCESS) {
+            fprintf(stderr, "[venc] init StartRecvFrame failed\n");
             CVI_VENC_DestroyChn(chn);
-            fclose(f);
             return false;
         }
+        chn_ready = true;
+        fprintf(stderr, "[venc] CHN1 pre-initialized %dx%d@%d\n", w, h, fps);
+        return true;
+    }
+
+    bool start(const std::string& path, int w, int h, int fps) {
+        // Finalize any in-progress recording.
+        if (active) {
+            for (int i = 0; i < 10; i++) drain(100);
+            if (fp) { fflush(fp); fclose(fp); fp = nullptr; }
+            fprintf(stderr, "[venc] stop frames=%d path=%s\n", frames, out_path.c_str());
+            active = false;
+        }
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "[venc] fopen failed %s\n", path.c_str());
+            return false;
+        }
+        // Ensure CHN1 is ready; init handles chn_ready guard.
+        if (!init(w, h, fps)) { fclose(f); return false; }
+        // Flush any stale packs from previous event.
+        for (int i = 0; i < 5; i++) drain(50);
+        CVI_VENC_RequestIDR(chn, CVI_FALSE);
         fp = f;
         active = true;
         frames = 0;
@@ -337,7 +446,7 @@ public:
     void send(VIDEO_FRAME_INFO_S* frame) {
         if (!active || !frame) return;
         CVI_S32 ret = CVI_VENC_SendFrame(chn, frame, 200);
-        if (ret == CVI_SUCCESS) {
+        if (ret == CVI_SUCCESS || ret == CVI_TRUE) {
             frames++;
             drain(1000);
         } else {
@@ -348,11 +457,10 @@ public:
 
     void stop() {
         if (!active) return;
-        for (int i = 0; i < 20; i++) {
-            drain(100);
-        }
+        for (int i = 0; i < 10; i++) drain(100);
         CVI_VENC_StopRecvFrame(chn);
         CVI_VENC_DestroyChn(chn);
+        chn_ready = false;
         if (fp) {
             fflush(fp);
             fclose(fp);
@@ -361,6 +469,8 @@ public:
         fprintf(stderr, "[venc] stop frames=%d path=%s\n", frames, out_path.c_str());
         active = false;
     }
+
+    void destroy() { stop(); }
 
     bool is_active() const { return active; }
 
@@ -398,6 +508,7 @@ private:
     }
 
     bool active;
+    bool chn_ready;
     VENC_CHN chn;
     FILE* fp;
     int frames;
@@ -507,16 +618,10 @@ int main(int argc, char *argv[]) {
         z.x = (disp_w - z.size) / 2; z.y = (disp_h - z.size) / 2;
         zones.push_back(z);
     }
-    // Clamp size + position to frame bounds.
+    // Enforce minimum size only. Zones may extend beyond frame; crop code pads with black.
     for (size_t i = 0; i < zones.size(); i++) {
         Zone &z = zones[i];
         if (z.size < infer_size) z.size = infer_size;
-        if (z.size > disp_w) z.size = disp_w;
-        if (z.size > disp_h) z.size = disp_h;
-        if (z.x < 0) z.x = 0;
-        if (z.y < 0) z.y = 0;
-        if (z.x > disp_w - z.size) z.x = disp_w - z.size;
-        if (z.y > disp_h - z.size) z.y = disp_h - z.size;
     }
     // Active follower: zone 0 re-centers each frame on previous frame's motion
     // centroid (smoothed 20%/frame). Triggered by --active-detector.
@@ -546,6 +651,7 @@ int main(int argc, char *argv[]) {
     }
     fprintf(stderr, "[motion] thresh=%.2f\n", motion_thresh);
 
+    cv::setNumThreads(1);  // single-core SoC: parallel_for_ overhead > benefit
     udp_init("127.0.0.1", udp_port);
 
     MJPEGWriter mjpeg(7777);
@@ -592,6 +698,7 @@ int main(int argc, char *argv[]) {
     std::vector<std::vector<TileDet> > zone_cache(zones.size());
     int active_zone = 0;
     cv::Mat tile_sq;  // pre-allocated, reused each frame
+    cv::Mat last_disp; // last regular-path frame, used to keep HLS alive during captureRaw
 
     // Inference frame skip: run NPU every INFER_EVERY frames, show cached boxes in between
     const int INFER_EVERY = 2;
@@ -600,8 +707,10 @@ int main(int argc, char *argv[]) {
     // Browser MJPEG preview is only for aiming/config. Keep it low-res and
     // throttled so JPEG encoding does not heat the SoC.
     cv::Mat prev_small;
+    const bool ENABLE_HLS = true;
+    int hls_fps = (target_fps > 0) ? target_fps : 15;
     long last_mjpeg_ms = 0;
-    const long MJPEG_FORCE_MS = 500;
+    const long MJPEG_FORCE_MS = ENABLE_HLS ? 2000 : 500;
     const char *HD_RECORD_CONTROL = "/tmp/ninti_hd_record_dir";
     const long HD_RECORD_INTERVAL_MS = 250;
     long last_hd_record_ms = 0;
@@ -609,8 +718,75 @@ int main(int argc, char *argv[]) {
     std::string hd_record_dir;
     H264Recorder h264rec;
     HlsStreamer hlsrec;
-    const bool ENABLE_HLS = false;  // Temporarily disabled: MJPEG is the default setup view.
-    int hls_fps = (target_fps > 0) ? target_fps : 25;
+    // BGR→NV21 buffer for HLS. VENC needs physically-contiguous ION memory.
+    cv::Mat hls_yuv;
+    CVI_U64 hls_ion_phy = 0;
+    void*   hls_ion_vir = nullptr;
+    VIDEO_FRAME_INFO_S hls_frame_info;
+    auto prepare_hls_frame = [&](const cv::Mat& bgr) -> VIDEO_FRAME_INFO_S* {
+        int w = bgr.cols, h = bgr.rows;
+        size_t y_size = (size_t)w * h;
+        size_t uv_size = y_size / 2;
+        size_t total = y_size + uv_size;
+        // Allocate ION buffer on first call (or if size changes).
+        if (hls_ion_vir == nullptr) {
+            if (CVI_SYS_IonAlloc_Cached(&hls_ion_phy, &hls_ion_vir, "hls_nv21", total) != 0) {
+                fprintf(stderr, "[hls] IonAlloc failed\n");
+                return nullptr;
+            }
+            fprintf(stderr, "[hls] ION alloc %zu bytes phy=0x%llx vir=%p\n",
+                    total, (unsigned long long)hls_ion_phy, hls_ion_vir);
+        }
+        uint8_t* buf = (uint8_t*)hls_ion_vir;
+        // Direct BGR → NV21: single-pass, no intermediate I420 buffer.
+        // NV21 layout: Y plane (w×h) + interleaved V,U plane (w×h/2 bytes).
+        long cvt_t0 = now_ms();
+        {
+            uint8_t* y_out  = buf;
+            uint8_t* vu_out = buf + y_size;  // NV21: V then U interleaved
+            const int stride = (int)bgr.step[0];
+            for (int row = 0; row < h; row++) {
+                const uint8_t* src = bgr.data + row * stride;
+                uint8_t* y_row = y_out + row * w;
+                for (int col = 0; col < w; col++) {
+                    int b = src[col*3], g = src[col*3+1], r = src[col*3+2];
+                    y_row[col] = (uint8_t)((66*r + 129*g + 25*b + 4224) >> 8);
+                }
+                if ((row & 1) == 0) {
+                    uint8_t* vu_row = vu_out + (row >> 1) * w;
+                    for (int col = 0; col < w; col += 2) {
+                        int b = src[col*3], g = src[col*3+1], r = src[col*3+2];
+                        vu_row[col]   = (uint8_t)((112*r - 94*g - 18*b + 32896) >> 8);  // V
+                        vu_row[col+1] = (uint8_t)((-38*r - 74*g + 112*b + 32896) >> 8); // U
+                    }
+                }
+            }
+        }
+        long cvt_t1 = now_ms();
+        long cvt_t2 = cvt_t1;  // no separate mcpy step
+        long fl_t0 = now_ms();
+        CVI_SYS_IonFlushCache(hls_ion_phy, hls_ion_vir, total);
+        long fl_ms = now_ms() - fl_t0;
+        static int fl_cnt = 0;
+        if (++fl_cnt <= 5 || fl_cnt % 100 == 0)
+            fprintf(stderr, "[hls] cvt=%ldms mcpy=%ldms ionflush=%ldms\n",
+                    cvt_t1-cvt_t0, cvt_t2-cvt_t1, fl_ms);
+        memset(&hls_frame_info, 0, sizeof(hls_frame_info));
+        VIDEO_FRAME_S& vf = hls_frame_info.stVFrame;
+        vf.u32Width  = w; vf.u32Height = h;
+        vf.enPixelFormat  = PIXEL_FORMAT_NV21;
+        vf.u32Stride[0]   = w; vf.u32Stride[1] = w;
+        vf.u32Length[0]   = y_size; vf.u32Length[1] = uv_size;
+        vf.pu8VirAddr[0]  = buf;
+        vf.pu8VirAddr[1]  = buf + y_size;
+        vf.u64PhyAddr[0]  = hls_ion_phy;
+        vf.u64PhyAddr[1]  = hls_ion_phy + y_size;
+        // Monotonic PTS in microseconds so the encoder timestamps frames correctly.
+        struct timespec ts_pts; clock_gettime(CLOCK_MONOTONIC, &ts_pts);
+        hls_frame_info.stVFrame.u64PTS = (uint64_t)ts_pts.tv_sec * 1000000ULL
+                                        + ts_pts.tv_nsec / 1000;
+        return &hls_frame_info;
+    };
     auto read_hd_record_dir = [&]() -> std::string {
         std::string dir;
         std::ifstream ctl(HD_RECORD_CONTROL);
@@ -629,6 +805,14 @@ int main(int argc, char *argv[]) {
 
     // Stage timing accumulators (printed once/sec)
     long acc_cap=0, acc_motion=0, acc_infer=0, acc_nms_draw=0, acc_mjpeg=0;
+    long acc_clone=0, acc_hls_send=0;
+
+    // Start HLS VENC before the main loop so CreateChn never runs while a VI
+    // frame is in-flight (which causes VI GetChnFrame to block permanently).
+    if (ENABLE_HLS) {
+        if (!hlsrec.start(disp_w, disp_h, hls_fps))
+            fprintf(stderr, "[hls] start failed — HLS disabled\n");
+    }
 
     struct timespec frame_start_ts;
     while (!interrupted) {
@@ -640,10 +824,8 @@ int main(int argc, char *argv[]) {
         // JPEG, motion detection, and NPU work while the clip is being written.
         std::string raw_requested_hd_dir = read_hd_record_dir();
         if (!raw_requested_hd_dir.empty() || !hd_record_dir.empty()) {
-            if (hlsrec.is_active()) {
-                hlsrec.stop();
-                usleep(300000);
-            }
+            // Keep HLS VENC running (CHN0 idle is fine) — don't stop/restart it
+            // since CreateChn during captureRaw causes VI pipeline stalls.
             VIDEO_FRAME_INFO_S* raw_frame = (VIDEO_FRAME_INFO_S*)cap.captureRaw();
             long t1 = now_ms();
             acc_cap += t1 - t0;
@@ -651,7 +833,9 @@ int main(int argc, char *argv[]) {
 
             if (raw_requested_hd_dir != hd_record_dir) {
                 if (!hd_record_dir.empty()) {
+                    hlsrec.pause_venc();
                     h264rec.stop();
+                    hlsrec.resume_venc();
                     write_hd_done(hd_record_dir);
                 }
                 hd_record_dir = raw_requested_hd_dir;
@@ -669,7 +853,20 @@ int main(int argc, char *argv[]) {
             if (hd_recording && raw_frame) {
                 h264rec.send(raw_frame);
             }
-            // skip hlsrec during captureRaw: raw_frame is full-res, HLS VENC is 720p
+            // send HLS at target_fps using last regular frame (rate-limited to avoid VENC overflow)
+            static long hls_raw_last_ms = 0;
+            long hls_now = now_ms();
+            long hls_interval_ms = 1000L / hls_fps;
+            if (ENABLE_HLS && hlsrec.is_active() && !last_disp.empty()
+                    && (hls_now - hls_raw_last_ms) >= hls_interval_ms) {
+                hls_raw_last_ms = hls_now;
+                cv::Mat hls_raw = last_disp;
+                if (last_disp.cols != hlsrec.get_w() || last_disp.rows != hlsrec.get_h())
+                    cv::resize(last_disp, hls_raw, cv::Size(hlsrec.get_w(), hlsrec.get_h()),
+                               0, 0, cv::INTER_LINEAR);
+                VIDEO_FRAME_INFO_S* nv21 = prepare_hls_frame(hls_raw);
+                if (nv21) hlsrec.send(nv21);
+            }
             cap.releaseImagePtr();
 
             fps_frames++;
@@ -694,13 +891,18 @@ int main(int argc, char *argv[]) {
         VIDEO_FRAME_INFO_S* original_frame = (VIDEO_FRAME_INFO_S*)cap.getOriginalImagePtr();
         long t1 = now_ms(); acc_cap += t1 - t0;
 
-        cv::Mat disp = frame;  // rotate done in VPSS (bMirror+bFlip)
+        // Deep-copy out of DMA buffer immediately; all downstream ops use cached heap memory.
+        cv::Mat disp = frame.clone();
+        last_disp = disp;
+        long t1a = now_ms();  // after clone
 
         long ts = t1;
         std::string requested_hd_dir = read_hd_record_dir();
         if (requested_hd_dir != hd_record_dir) {
             if (!hd_record_dir.empty()) {
+                hlsrec.pause_venc();
                 h264rec.stop();
+                hlsrec.resume_venc();
                 write_hd_done(hd_record_dir);
             }
             hd_record_dir = requested_hd_dir;
@@ -709,21 +911,37 @@ int main(int argc, char *argv[]) {
             if (!hd_record_dir.empty() && original_frame) {
                 VIDEO_FRAME_S& vf = original_frame->stVFrame;
                 std::string h264_path = dirname_of(hd_record_dir) + "/event.h264";
-                h264rec.start(h264_path, (int)vf.u32Width, (int)vf.u32Height, 25);
+                h264rec.start(h264_path, (int)vf.u32Width, (int)vf.u32Height, target_fps > 0 ? target_fps : 25);
                 fprintf(stderr, "[hdrec] start dir=%s h264=%s\n", hd_record_dir.c_str(), h264_path.c_str());
             }
         }
         bool hd_recording = !hd_record_dir.empty();
         if (hd_recording && original_frame) {
+            long hdr_t0 = now_ms();
             h264rec.send(original_frame);
+            fprintf(stderr, "[diag] h264rec.send %ldms\n", now_ms()-hdr_t0);
         }
-        if (ENABLE_HLS && original_frame) {
-            if (!hlsrec.is_active()) {
-                VIDEO_FRAME_S& vf = original_frame->stVFrame;
-                hlsrec.start((int)vf.u32Width, (int)vf.u32Height, hls_fps);
-            }
-            hlsrec.send(original_frame);
+        if (ENABLE_HLS && hlsrec.is_active() && !disp.empty()) {
+            // IDR requests are now issued by the drain thread after each drain —
+            // calling RequestIDR from the main thread blocks while drain polls VENC.
+            // Downscale to HLS resolution (capped at 1280x720 in HlsStreamer::start)
+            long pr_t0 = now_ms();
+            cv::Mat hls_frame = disp;
+            if (disp.cols != hlsrec.get_w() || disp.rows != hlsrec.get_h())
+                cv::resize(disp, hls_frame, cv::Size(hlsrec.get_w(), hlsrec.get_h()),
+                           0, 0, cv::INTER_LINEAR);
+            VIDEO_FRAME_INFO_S* nv21 = prepare_hls_frame(hls_frame);
+            static int pr_cnt = 0;
+            if (++pr_cnt <= 5 || pr_cnt % 100 == 0)
+                fprintf(stderr, "[diag] prepare_hls %ldms drain_req=%d\n", now_ms()-pr_t0, (int)hlsrec.is_drain_requested());
+            static int hls_call = 0;
+            if (++hls_call <= 15 || hls_call % 50 == 0)
+                fprintf(stderr, "[hls] call send #%d nv21=%p venc=%d\n",
+                        hls_call, (void*)nv21, (int)hlsrec.is_venc_active());
+            if (nv21) hlsrec.send(nv21);
         }
+        long t1b = now_ms();  // after HLS send
+        acc_clone += t1a - t1; acc_hls_send += t1b - t1a;
         cap.releaseImagePtr();
 
         // Motion detection on raw frame (before box drawing) at 1/4 res
@@ -777,12 +995,26 @@ int main(int argc, char *argv[]) {
         if (!hd_recording && npu_active && frame_count % INFER_EVERY == 0) {
             int z = active_zone;
             const Zone &zone = zones[z];
-            cv::Mat region = disp(cv::Rect(zone.x, zone.y, zone.size, zone.size));
-            // Resize zone crop down to infer_size. When zone.size == infer_size
-            // this is an identity-copy (no-op); INTER_AREA gives best quality
-            // for the >infer_size downscale case.
-            int interp = (zone.size == infer_size) ? cv::INTER_NEAREST : cv::INTER_AREA;
-            cv::resize(region, tile_sq, cv::Size(infer_size, infer_size), 0, 0, interp);
+            // Padded crop: zone may extend beyond frame — out-of-bounds area filled black.
+            // Scale visible portion directly into infer_size tile to avoid large intermediate buffer.
+            tile_sq.create(infer_size, infer_size, disp.type());
+            tile_sq.setTo(cv::Scalar(0, 0, 0));
+            int sx = std::max(0, zone.x), sy = std::max(0, zone.y);
+            int ex = std::min(disp_w, zone.x + zone.size);
+            int ey = std::min(disp_h, zone.y + zone.size);
+            if (ex > sx && ey > sy) {
+                float sc2 = (float)infer_size / zone.size;
+                int dx = (int)((sx - zone.x) * sc2);
+                int dy = (int)((sy - zone.y) * sc2);
+                int dw = std::min((int)((ex - sx) * sc2), infer_size - dx);
+                int dh = std::min((int)((ey - sy) * sc2), infer_size - dy);
+                if (dw > 0 && dh > 0) {
+                    int interp = (zone.size == infer_size) ? cv::INTER_NEAREST : cv::INTER_AREA;
+                    cv::resize(disp(cv::Rect(sx, sy, ex-sx, ey-sy)),
+                               tile_sq(cv::Rect(dx, dy, dw, dh)),
+                               cv::Size(dw, dh), 0, 0, interp);
+                }
+            }
 
             cvtdl_object_t objs = detector.detect(tile_sq);
             zone_cache[z].clear();
@@ -876,11 +1108,13 @@ int main(int argc, char *argv[]) {
         long now = t5;
         if (now - fps_last >= 1000) {
             float fps = fps_frames * 1000.0f / (now - fps_last);
-            fprintf(stderr, "[timing/f] cap=%ld motion=%ld infer=%ld nms+draw=%ld mjpeg=%ld total=%ld ms (fps=%.1f)\n",
-                    acc_cap/fps_frames, acc_motion/fps_frames, acc_infer/fps_frames,
+            fprintf(stderr, "[timing/f] cap=%ld clone=%ld hls_send=%ld motion=%ld infer=%ld nms+draw=%ld mjpeg=%ld total=%ld ms (fps=%.1f)\n",
+                    acc_cap/fps_frames, acc_clone/fps_frames, acc_hls_send/fps_frames,
+                    acc_motion/fps_frames, acc_infer/fps_frames,
                     acc_nms_draw/fps_frames, acc_mjpeg/fps_frames,
                     (acc_cap+acc_motion+acc_infer+acc_nms_draw+acc_mjpeg)/fps_frames, fps);
             acc_cap=acc_motion=acc_infer=acc_nms_draw=acc_mjpeg=0;
+            acc_clone=acc_hls_send=0;
             snprintf(buf, sizeof(buf), "{\"_fps\":%.1f}", fps);
             udp_send(buf);
             fps_frames = 0;
@@ -907,10 +1141,14 @@ int main(int argc, char *argv[]) {
 
     printf("Stopping...\n");
     hlsrec.stop();
+    if (hls_ion_vir) {
+        CVI_SYS_IonFree(hls_ion_phy, hls_ion_vir);
+        hls_ion_vir = nullptr;
+    }
     if (!hd_record_dir.empty()) {
-        h264rec.stop();
         write_hd_done(hd_record_dir);
     }
+    h264rec.destroy();
     {
         std::lock_guard<std::mutex> lock(hd_queue_mutex);
         hd_writer_stop = true;

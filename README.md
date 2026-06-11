@@ -39,11 +39,18 @@ AI TRACKING    (center-distance + IoU tracking, 5s still/lost timeout)
 
 Key behaviors:
 
-- Motion detect fires on pixel-level frame difference (no AI needed)
+- Motion detect fires on pixel-level frame difference on the full frame at 1/4 scale (no AI needed, fast)
+- YOLO inference runs **only on the detection zone crop** (default 640x640), not the full frame — significantly reduces NPU workload and inference latency
 - AI detect suppresses motion detect while active
 - Tracking allows up to 1s detection gap before losing a track
 - Object still for 5s or absent for 5s triggers save
 - Any object detected at least once is saved (never discarded if tracked)
+
+### Detection zone
+
+Configured as `detection_zones` in `/root/ninti_config.json` (x, y, size in sensor pixels). The YOLO model receives only the cropped zone resized to `infer_size` (640). Coordinates of detections are scaled back to full-frame space before drawing and UDP broadcast.
+
+HLS live stream is always encoded at 1280x720 regardless of sensor resolution. Sensor can be set higher (e.g. 1920x1080) for higher-quality event recordings while keeping live view at 720p.
 
 ## Web UI
 
@@ -76,17 +83,21 @@ scp S98ninti_sidecar root@<ip>:/etc/init.d/S98ninti_sidecar
 ssh root@<ip> "chmod +x /etc/init.d/S98ninti_sidecar"
 ```
 
-Update sidecar (graceful, avoids VPSS conflict):
+Update sidecar only (graceful, avoids VPSS conflict):
 
 ```sh
-# 1. Stop stream_yolo cleanly via API
-curl -X POST http://<ip>:7778/api/yolo/stop
-
-# 2. Copy new sidecar
 scp sidecar.py root@<ip>:/root/sidecar.py
-
-# 3. Restart service
 ssh root@<ip> "/etc/init.d/S98ninti_sidecar restart"
+# init script calls /api/yolo/stop first, then restarts — no manual curl needed
+# DO NOT use killall stream_yolo — bypasses VPSS cleanup and corrupts hardware state
+```
+
+Update binary + sidecar (requires reboot for clean VPSS state):
+
+```sh
+scp build-riscv/bin/stream_yolo root@<ip>:/root/stream_yolo.new
+scp sidecar.py root@<ip>:/root/sidecar.py
+ssh root@<ip> "mv /root/stream_yolo.new /root/stream_yolo && reboot"
 ```
 
 ## Known Issues
