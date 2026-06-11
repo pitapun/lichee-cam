@@ -908,8 +908,18 @@ def udp_listener():
         except Exception:
             pass
 
-# ---- Embedded HTML (single-file) ----
-HTML = b'''<!DOCTYPE html>
+# ---- HTML served from index.html (read from disk each request) ----
+_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html')
+
+def _read_index_html():
+    try:
+        with open(_INDEX_PATH, 'rb') as f:
+            return f.read()
+    except Exception:
+        return b'<h1>index.html not found</h1>'
+
+if False:
+    HTML = b'''<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -982,12 +992,15 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 .ev-mini .ev-thumb-wrap{aspect-ratio:16/9;overflow:hidden;background:#000}
 .ev-mini .ev-thumb-wrap img{width:100%;height:100%;object-fit:cover;display:block}
 .ev-mini .ev-thumb-wrap .ev-no-thumb{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:22px;color:#333}
-.ev-mini .ev-info{padding:6px 8px;flex:0 0 auto}
-.ev-mini .ev-head{display:flex;align-items:center;gap:5px;margin-bottom:2px}
-.ev-mini .ev-cat{font-size:10px;color:#8cf;font-weight:bold;text-transform:uppercase;letter-spacing:.05em;flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.ev-mini .ev-score{font-size:10px;color:#8f8;flex:0 0 auto}
-.ev-mini .muted{font-size:10px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ev-mini .ev-dur{font-size:10px;color:#555}
+.ev-mini .ev-info{padding:8px 10px;flex:0 0 auto}
+.ev-mini .ev-head{display:flex;align-items:center;gap:6px;margin-bottom:3px}
+.ev-mini .ev-cat{font-size:13px;color:#8cf;font-weight:bold;text-transform:uppercase;letter-spacing:.05em;flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.ev-mini .ev-score{font-size:13px;color:#8f8;flex:0 0 auto}
+.ev-mini .muted{font-size:12px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ev-mini .ev-dur{font-size:12px;color:#555}
+.ev-mini .ev-meta-row{display:flex;align-items:center;gap:6px;margin-top:3px}
+.ev-mini .ev-id{font-size:11px;color:#555;flex:0 0 auto}
+.ev-mini .ev-dt{font-size:11px;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .thumb{display:none}
 .ev-noresult{grid-column:1/-1;padding:40px 20px;color:#555;font-size:12px;text-align:center}
 /* lightbox */
@@ -1334,6 +1347,9 @@ function loadEvents(){
         const thumb=thumbForEvent(e);
         const item=document.createElement('div');
         item.className='ev-mini'+(hasVideo?' video':'');
+        const ts=e.first_seen||e.t;
+        const dt=ts?new Date(ts*1000).toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:false}):'';
+        const eid=e.track_id!=null?'#'+e.track_id:'';
         item.innerHTML=
           `<div class="ev-thumb-wrap">`+
             (thumb?`<img src="http://${ip}:7778${thumb}" loading="lazy">`:'<div class="ev-no-thumb">?</div>')+
@@ -1344,6 +1360,7 @@ function loadEvents(){
               `<span class="ev-score">${sc}</span>`+
             `</div>`+
             `<div class="muted">${e.name||''}&nbsp;<span class="ev-dur">${dur}</span></div>`+
+            `<div class="ev-meta-row"><span class="ev-id">${eid}</span><span class="ev-dt">${dt}</span></div>`+
           `</div>`;
         if(hasVideo){
           item.onclick=()=>openLightbox(e);
@@ -2005,7 +2022,7 @@ function setStream(mode) {
 }
 </script>
 </body>
-</html>'''
+</html>'''  # end of dead-code block — actual HTML served from index.html
 
 # ---- HTTP handler ----
 class Handler(BaseHTTPRequestHandler):
@@ -2110,10 +2127,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path in ('/', '/index.html'):
+            body = _read_index_html()
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(HTML)
+            self.wfile.write(body)
 
         elif path == '/api/config':
             self.send_response(200)

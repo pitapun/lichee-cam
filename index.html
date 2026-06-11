@@ -1,0 +1,1104 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NintiDetect</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:monospace;background:#111;color:#eee;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+/* top nav */
+#topnav{display:flex;align-items:center;height:46px;background:#141414;border-bottom:1px solid #2a2a2a;padding:0 16px;flex:0 0 auto;gap:0}
+#nav-brand{font-size:12px;letter-spacing:.12em;color:#8cf;font-weight:bold;margin-right:28px;user-select:none}
+#nav-tabs{display:flex;height:100%}
+.nav-tab{padding:0 22px;height:100%;background:transparent;border:0;border-bottom:3px solid transparent;font-family:monospace;font-size:11px;letter-spacing:.08em;color:#555;cursor:pointer;text-transform:uppercase;transition:color .12s;white-space:nowrap}
+.nav-tab:hover{color:#aaa}
+.nav-tab.active{color:#8cf;border-bottom-color:#8cf}
+#nav-status{margin-left:auto;font-size:11px;color:#555;display:flex;align-items:center;gap:10px}
+#status{color:#8cf;font-size:11px}
+
+/* main tab pages */
+.main-tab{display:none;flex:1;min-height:0;overflow:hidden}
+.main-tab.active{display:flex}
+
+/* live tab */
+#zone-panel{width:200px;flex:0 0 200px;padding:10px;background:#141414;display:flex;flex-direction:column;border-left:1px solid #2a2a2a;overflow-y:auto;font-size:12px;gap:10px}
+#zone-panel .panel-head{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:4px;margin-bottom:6px;letter-spacing:.1em;text-transform:uppercase}
+.zp-section{display:flex;flex-direction:column;gap:4px}
+.zp-section h3{font-size:10px;color:#555;letter-spacing:.08em;text-transform:uppercase;margin-bottom:2px}
+#pipeline-panel{width:176px;flex:0 0 176px;padding:12px 10px;background:#141414;display:flex;flex-direction:column;border-right:1px solid #2a2a2a;overflow-y:auto;font-size:12px}
+.panel-head{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:4px;margin-bottom:10px;letter-spacing:.1em;text-transform:uppercase}
+#stream-area{flex:1;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}
+#stream{display:block;width:100%;height:100%;object-fit:contain;image-rendering:pixelated}
+#hlsPlayer{display:none;width:100%;height:100%;object-fit:contain}
+#hlsCanvas{display:none;width:100%;height:100%}
+#overlay{position:absolute;cursor:crosshair}
+#stream-btns{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);display:flex;gap:6px}
+
+/* pipeline */
+.pipeline{display:flex;flex-direction:column;align-items:stretch;gap:0}
+.pnode{border:1px solid #2a2a2a;padding:7px 10px;background:#1a1a1a;transition:background .15s,border-color .15s;cursor:default}
+.pnode .pname{font-size:11px;font-weight:bold;color:#555;letter-spacing:.03em;transition:color .15s}
+.pnode .pinfo{font-size:10px;color:#444;margin-top:2px;min-height:12px;transition:color .15s}
+.pnode.active{background:#0d2a0d;border-color:#2a6a2a}
+.pnode.active .pname{color:#4f4}
+.pnode.active .pinfo{color:#2a2}
+.pnode.flash-save{background:#0d2a1a;border-color:#2a6a4a}
+.pnode.flash-save .pname{color:#4fa}
+.pnode.flash-discard{background:#2a1a0d;border-color:#6a4a2a}
+.pnode.flash-discard .pname{color:#fa8}
+.parrow{text-align:center;color:#333;font-size:14px;line-height:1;margin:2px 0;user-select:none}
+.parrow.active{color:#2a6a2a}
+.pardiv{display:flex;justify-content:space-around;color:#333;font-size:11px;line-height:1;margin:2px 0}
+.pstat{margin-top:14px;border-top:1px solid #222;padding-top:10px;display:flex;flex-direction:column;gap:6px}
+.st-row{display:flex;flex-direction:column;gap:1px}
+.st-label{font-size:10px;color:#555}
+.st-val{font-size:13px;color:#ccc}
+.st-val.on{color:#0f0}
+.st-val.off{color:#555}
+.st-val.warn{color:#fa5}
+
+/* events tab */
+#main-events{overflow-y:auto;display:none}
+#main-events.active{display:block}
+#ev-toolbar{position:sticky;top:0;z-index:2;background:#0e0e0e;border-bottom:1px solid #2a2a2a;padding:8px 16px;display:flex;align-items:center;gap:10px}
+.ev-title{font-size:10px;color:#555;letter-spacing:.1em;text-transform:uppercase;flex:1}
+.ev-count{font-size:11px;color:#555}
+#eventsLeft{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:2px;padding:2px;background:#0a0a0a}
+.ev-mini{display:flex;flex-direction:column;cursor:pointer;overflow:hidden;background:#141414;transition:opacity .15s}
+.ev-mini:hover{opacity:.8}
+.ev-mini .ev-thumb-wrap{aspect-ratio:16/9;overflow:hidden;background:#000}
+.ev-mini .ev-thumb-wrap img{width:100%;height:100%;object-fit:cover;display:block}
+.ev-mini .ev-thumb-wrap .ev-no-thumb{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:22px;color:#333}
+.ev-mini .ev-info{padding:8px 10px;flex:0 0 auto}
+.ev-mini .ev-head{display:flex;align-items:center;gap:6px;margin-bottom:3px}
+.ev-mini .ev-cat{font-size:13px;color:#8cf;font-weight:bold;text-transform:uppercase;letter-spacing:.05em;flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.ev-mini .ev-score{font-size:13px;color:#8f8;flex:0 0 auto}
+.ev-mini .muted{font-size:12px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ev-mini .ev-dur{font-size:12px;color:#555}
+.ev-mini .ev-meta-row{display:flex;align-items:center;gap:6px;margin-top:3px}
+.ev-mini .ev-id{font-size:11px;color:#555;flex:0 0 auto}
+.ev-mini .ev-dt{font-size:11px;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.thumb{display:none}
+.ev-noresult{grid-column:1/-1;padding:40px 20px;color:#555;font-size:12px;text-align:center}
+/* lightbox */
+#ev-lightbox{display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.92);flex-direction:column;align-items:center;justify-content:center}
+#ev-lightbox.open{display:flex}
+#ev-lb-close{position:absolute;top:14px;right:18px;font-size:22px;color:#888;cursor:pointer;line-height:1;background:none;border:none;padding:4px 8px}
+#ev-lb-close:hover{color:#fff}
+#ev-lb-inner{position:relative;max-width:90vw;max-height:82vh;display:flex;align-items:center;justify-content:center}
+#eventPlayer{max-width:90vw;max-height:78vh;background:#000;display:none}
+#eventFramePlayer{max-width:90vw;max-height:78vh;object-fit:contain;background:#000;display:none}
+#ev-meta{margin-top:10px;font-size:11px;color:#666;text-align:center;line-height:1.8}
+
+/* detection-zone preview in settings */
+/* settings tab */
+#main-settings{overflow-y:auto;display:none}
+#main-settings.active{display:block}
+#settings-inner{max-width:560px;margin:0 auto;padding:20px 16px;display:flex;flex-direction:column;gap:14px}
+.s-section{background:#141414;border:1px solid #2a2a2a;padding:14px 16px}
+.s-section h2{font-size:10px;color:#666;border-bottom:1px solid #222;padding-bottom:5px;margin-bottom:10px;letter-spacing:.1em;text-transform:uppercase}
+.s-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.s-row:last-child{margin-bottom:0}
+.s-label{font-size:11px;color:#666;min-width:80px}
+
+/* common */
+input[type=range]{width:100%}
+input[type=text],select{background:#222;color:#eee;border:1px solid #555;padding:4px 6px;font-family:monospace;font-size:12px}
+button{background:#2a2a2a;color:#ddd;border:1px solid #555;padding:5px 10px;cursor:pointer;font-family:monospace;font-size:12px}
+button:hover{background:#3a3a3a}
+button.red{border-color:#633;color:#f88}
+button.red:hover{background:#2a1010}
+button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
+.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+#log{height:200px;overflow-y:auto;background:#0a0a0a;padding:6px;border:1px solid #2a2a2a;line-height:1.5}
+.ll{color:#0f0;padding:1px 0;font-size:12px}
+.hint{color:#555;font-size:11px}
+.zi{background:#1e1e1e;border:1px solid #333;padding:5px;margin-bottom:4px}
+.zn{font-weight:bold}
+.mode-radio{display:flex;gap:10px;flex-wrap:wrap}
+.mode-radio label{display:flex;align-items:center;gap:4px;cursor:pointer;padding:5px 10px;border:1px solid #444}
+.mode-radio label.active{border-color:#4a8a4a;background:#1a3a1a;color:#8f8}
+.dot{width:7px;height:7px;border-radius:50%;background:#555;display:inline-block}
+.dot.on{background:#0f0}
+.dot.off{background:#555}
+</style>
+</head>
+<body>
+
+<div id="topnav">
+  <span id="nav-brand">NINTIDETECT</span>
+  <div id="nav-tabs">
+    <button class="nav-tab active" onclick="showMainTab('live',this)">&#9654; Live</button>
+    <button class="nav-tab" onclick="showMainTab('events',this)">Events</button>
+    <button class="nav-tab" onclick="showMainTab('settings',this)">Settings</button>
+  </div>
+  <div id="nav-status">
+    <span class="dot" id="dotYolo"></span><span id="stMode" style="margin-left:5px">-</span>
+    <span id="stTemp">-</span>
+    <span id="status"></span>
+  </div>
+</div>
+
+<!-- -- Tab 1: Live -- -->
+<div class="main-tab active" id="main-live">
+
+  <div id="pipeline-panel">
+    <div class="panel-head">Pipeline</div>
+    <div class="pipeline">
+      <div class="pnode" id="pn-motion">
+        <div class="pname">MOTION</div>
+        <div class="pinfo" id="pi-motion">-</div>
+      </div>
+      <div class="parrow" id="pa-motion">&#x25BC;</div>
+      <div class="pnode" id="pn-ai">
+        <div class="pname">AI DETECT</div>
+        <div class="pinfo" id="pi-ai">-</div>
+      </div>
+      <div class="parrow" id="pa-ai">&#x25BC;</div>
+      <div class="pnode" id="pn-track">
+        <div class="pname">TRACKING</div>
+        <div class="pinfo" id="pi-track">-</div>
+      </div>
+      <div class="pardiv" id="pa-track">
+        <span>&#x25C4; discard</span>
+        <span>save &#x25BA;</span>
+      </div>
+      <div style="display:flex;gap:6px">
+        <div class="pnode" id="pn-discard" style="flex:1">
+          <div class="pname">DISCARD</div>
+          <div class="pinfo" id="pi-discard"></div>
+        </div>
+        <div class="pnode" id="pn-save" style="flex:1">
+          <div class="pname">SAVE</div>
+          <div class="pinfo" id="pi-save"></div>
+        </div>
+      </div>
+    </div>
+    <div class="pstat">
+      <div class="st-row"><span class="st-label">detector</span><span class="st-val off" id="stYolo">-</span></div>
+      <div class="st-row"><span class="st-label">tracks</span><span class="st-val" id="stTracks">0</span></div>
+      <div class="st-row"><span class="st-label">threshold</span><span class="st-val" id="stThresh">-</span></div>
+      <div class="st-row"><span class="st-label">fps</span><span class="st-val" id="stFps">-</span></div>
+      <div class="st-row"><span class="st-label">last det</span><span class="st-val" id="stLastDet" style="font-size:10px;line-height:1.4">-</span></div>
+    </div>
+  </div>
+
+  <div id="stream-area">
+    <img id="stream" src="" alt="stream offline">
+    <video id="hlsPlayer" muted autoplay playsinline style="display:none"></video>
+    <canvas id="hlsCanvas" style="display:none;width:100%;height:100%;object-fit:contain"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="stream-btns">
+      <button onclick="setStream('hls')"   id="btnHls">HLS</button>
+      <button onclick="setStream('mjpeg')" id="btnMjpeg">MJPEG</button>
+    </div>
+  </div>
+
+  <div id="zone-panel">
+    <div class="zp-section">
+      <div class="panel-head">Detection Zones</div>
+      <button onclick="addDetZone()" style="width:100%">+ Add zone</button>
+      <button onclick="delLastDetZone()" class="red" style="width:100%">- Remove last</button>
+      <button id="activeBtn" onclick="toggleActiveDetector()" style="width:100%">Zone 1 follower: OFF</button>
+      <div class="hint" style="font-size:10px;color:#555;margin-top:2px">Follows detected target when ON</div>
+      <div id="dzlist" class="hint"></div>
+      <button onclick="applyAll()" class="act apply-all-btn" style="width:100%">Apply</button>
+    </div>
+    <div class="zp-section">
+      <div class="panel-head">Filter Zones</div>
+      <div style="display:flex;gap:4px">
+        <input id="zname" type="text" placeholder="zone name" style="flex:1;min-width:0">
+        <button onclick="newZone()">+</button>
+        <button onclick="cancelZone()" class="red">x</button>
+      </div>
+      <div id="zlist"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- -- Tab 2: Events -- -->
+<div class="main-tab" id="main-events">
+  <div id="ev-toolbar">
+    <span class="ev-title">Events</span>
+    <span class="ev-count" id="eventStatusLeft"></span>
+    <button onclick="loadEvents()" style="font-size:10px;padding:2px 8px">Refresh</button>
+  </div>
+  <div id="eventsLeft"><div class="ev-noresult">No events yet</div></div>
+</div>
+
+<!-- lightbox -->
+<div id="ev-lightbox">
+  <button id="ev-lb-close" onclick="closeLightbox()">x</button>
+  <div id="ev-lb-inner">
+    <video id="eventPlayer" controls muted playsinline></video>
+    <img id="eventFramePlayer" alt="">
+  </div>
+  <div id="ev-meta"></div>
+</div>
+
+<!-- -- Tab 3: Settings -- -->
+<div class="main-tab" id="main-settings">
+<div id="settings-inner">
+
+  <div class="s-section">
+    <h2>Connection</h2>
+    <div class="s-row">
+      <input id="ip" type="text" placeholder="board IP" style="flex:1" value="">
+      <button onclick="connect()">Connect</button>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Mode</h2>
+    <div class="mode-radio" id="modeRadio">
+      <label id="lbl_ninti"><input type="radio" name="mode" value="ninti" onchange="pendingMode='ninti';updateModeLabels()"> NintiDetect</label>
+      <label id="lbl_rtsp"><input type="radio" name="mode" value="rtsp" onchange="pendingMode='rtsp';updateModeLabels()"> RTSP</label>
+    </div>
+    <div class="s-row" style="margin-top:8px">
+      <button onclick="applyMode()" style="flex:1">Switch Mode</button>
+      <span class="hint" id="modeStatus"></span>
+    </div>
+    <div class="row hint" style="margin-top:4px;gap:8px">
+      <span class="dot" id="dotRtsp"></span> rtsp
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Camera</h2>
+    <div class="s-row">
+      <span class="s-label">Resolution</span>
+      <select id="senRes" style="flex:1">
+        <option value="1280,720">1280 x 720</option>
+        <option value="1920,1080">1920 x 1080 (HD)</option>
+        <option value="2560,1440">2560 x 1440 (QHD)</option>
+      </select>
+      <button onclick="rebootDevice()" style="margin-left:6px">Reboot</button>
+    </div>
+    <div class="s-row">
+      <span class="s-label">FPS cap</span>
+      <input type="range" id="fpsCap" min="0" max="30" step="1" value="15" style="flex:1"
+             oninput="document.getElementById('fpsv').textContent=this.value==0?'off':this.value">
+      <span id="fpsv" style="width:32px;text-align:right">15</span>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Threshold</h2>
+    <div class="s-row">
+      <input type="range" id="th" min="0.05" max="0.95" step="0.05" value="0.45" style="flex:1"
+             oninput="document.getElementById('thv').textContent=parseFloat(this.value).toFixed(2)">
+      <span id="thv" style="width:36px;text-align:right">0.45</span>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Motion Detect</h2>
+    <div class="s-row">
+      <button id="btnMotion" onclick="toggleMotion()" style="flex:1">-</button>
+    </div>
+    <div class="s-row">
+      <span class="s-label">Sensitivity</span>
+      <input type="range" id="mth" min="5" max="50" step="5" value="20" style="flex:1"
+             oninput="document.getElementById('mthv').textContent=this.value">
+      <span id="mthv" style="width:28px;text-align:right">20</span>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Filter Classes</h2>
+    <div id="fclasses"></div>
+  </div>
+
+  <div class="s-section">
+    <h2>Detections Log</h2>
+    <div id="log"></div>
+  </div>
+
+  <button onclick="applyAll()" class="act apply-all-btn" style="width:100%;padding:10px;font-size:13px;margin-top:8px">Apply</button>
+
+</div>
+</div>
+
+<!-- hidden compat elements -->
+<div style="display:none">
+  <div id="events"></div>
+  <span id="eventStatus"></span>
+  <span id="stRtsp"></span>
+</div>
+
+<script src="/hls.min.js"></script>
+<script>
+const PALETTE=['#f55','#5af','#5f5','#fa5','#a5f','#ff5','#5ff'];
+const INFER_SZ=640; const MAX_DET_ZONES=4;
+let liveActiveZone=null;  // [x,y,size] from stream_yolo when active follower is on
+let liveActiveZoneTs=0;
+// When the user drags the active zone, suppress live-position overrides on the
+// render so they can see their new size/position. Cleared by applyDetector
+// (i.e. once the new value has been sent to stream_yolo).
+let dzCfgDirty=false;
+let cfg={mode:'ninti',threshold:0.45,zones:[],filter_classes:['person','vehicle','animal'],
+         detection_zones:[],active_detector:false,sensor_width:1280,sensor_height:720};
+let drawing=null;
+let hover=null;
+let flashes=[];
+let ip='';
+let es=null;
+let pendingMode='ninti';
+let dzDrag=null;  // {idx,offX,offY} during detection-zone drag
+let eventPlaybackTimer=null;
+var _hlsObj=null;
+var _streamMode='mjpeg';
+
+const streamEl=document.getElementById('stream');
+const cvs=document.getElementById('overlay');
+const ctx=cvs.getContext('2d');
+
+if(location.hostname && location.hostname!=='localhost'){
+  document.getElementById('ip').value=location.hostname;
+}
+
+function getip(){return document.getElementById('ip').value.trim()||location.hostname;}
+
+function connect(){
+  ip=getip();
+  loadConf();
+  loadEvents();
+  openSSE();
+  pollStatus();
+  setInterval(loadEvents, 5000);
+  setStream('hls');
+}
+
+function loadConf(){
+  fetch('http://'+ip+':7778/api/config')
+    .then(r=>r.json()).then(c=>{
+      cfg=c;
+      pendingMode=c.mode||'ninti';
+      document.getElementById('th').value=c.threshold;
+      document.getElementById('thv').textContent=parseFloat(c.threshold).toFixed(2);
+      document.querySelectorAll('input[name=mode]').forEach(r=>{r.checked=(r.value===pendingMode);});
+      updateModeLabels();
+      const ms=c.motion_sensitivity||20;
+      document.getElementById('mth').value=ms;
+      document.getElementById('mthv').textContent=ms;
+      updateMotionBtn();
+      if(!Array.isArray(cfg.detection_zones)) cfg.detection_zones=[];
+      cfg.detection_zones.forEach(z=>{ if(!z.size) z.size=INFER_SZ; });
+      cfg.active_detector = !!c.active_detector;
+      cfg.sensor_width = c.sensor_width||1280;
+      cfg.sensor_height= c.sensor_height||720;
+      const sr=document.getElementById('senRes');
+      if(sr) sr.value=cfg.sensor_width+','+cfg.sensor_height;
+      const fc=document.getElementById('fpsCap');
+      const tfps=(c.target_fps==null)?15:c.target_fps;
+      if(fc){fc.value=tfps; document.getElementById('fpsv').textContent=tfps==0?'off':tfps;}
+      renderDzList();
+      renderZones(); renderClasses();
+    }).catch(e=>setStatus('load config failed: '+e));
+}
+
+function saveConf(){
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)
+  }).then(r=>r.json()).then(()=>setStatus('Saved.')).catch(e=>setStatus('save failed: '+e));
+}
+
+function loadEvents(){
+  const listEl=document.getElementById('eventsLeft');
+  const countEl=document.getElementById('eventStatusLeft');
+  if(!ip)return;
+  fetch('http://'+ip+':7778/api/events')
+    .then(r=>r.json()).then(rows=>{
+      if(countEl) countEl.textContent=rows.length+' events';
+      if(!listEl) return;
+      if(!rows.length){
+        listEl.innerHTML='<div class="ev-noresult">No events yet</div>';
+        return;
+      }
+      listEl.innerHTML='';
+      rows.slice().reverse().forEach(e=>{
+        const hasVideo=!!(e.video_url||e.frames_url||e.event_meta_url);
+        const dur=e.duration_s!==undefined ? Number(e.duration_s).toFixed(1)+'s' : '';
+        const sc=e.best_score!==undefined ? (Number(e.best_score)*100).toFixed(0)+'%' : '';
+        const thumb=thumbForEvent(e);
+        const item=document.createElement('div');
+        item.className='ev-mini'+(hasVideo?' video':'');
+        const ts=e.first_seen||e.t;
+        const dt=ts?new Date(ts*1000).toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:false}):'';
+        const eid=e.track_id!=null?'#'+e.track_id:'';
+        item.innerHTML=
+          `<div class="ev-thumb-wrap">`+
+            (thumb?`<img src="http://${ip}:7778${thumb}" loading="lazy">`:'<div class="ev-no-thumb">?</div>')+
+          `</div>`+
+          `<div class="ev-info">`+
+            `<div class="ev-head">`+
+              `<span class="ev-cat">${e.cat||'?'}</span>`+
+              `<span class="ev-score">${sc}</span>`+
+            `</div>`+
+            `<div class="muted">${e.name||''}&nbsp;<span class="ev-dur">${dur}</span></div>`+
+            `<div class="ev-meta-row"><span class="ev-id">${eid}</span><span class="ev-dt">${dt}</span></div>`+
+          `</div>`;
+        if(hasVideo){
+          item.onclick=()=>openLightbox(e);
+        }
+        listEl.appendChild(item);
+      });
+      listEl.scrollTop=0;
+    }).catch(()=>{
+      if(countEl) countEl.textContent='failed';
+    });
+}
+
+function openLightbox(e){
+  const lb=document.getElementById('ev-lightbox');
+  lb.classList.add('open');
+  document.getElementById('ev-meta').textContent='';
+  playEvent(e);
+}
+function closeLightbox(){
+  const lb=document.getElementById('ev-lightbox');
+  lb.classList.remove('open');
+  const player=document.getElementById('eventPlayer');
+  player.pause();
+  player.src='';
+  player.style.display='none';
+  if(eventPlaybackTimer){clearInterval(eventPlaybackTimer);eventPlaybackTimer=null;}
+  document.getElementById('eventFramePlayer').style.display='none';
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeLightbox();});
+document.getElementById('ev-lightbox').addEventListener('click',function(e){if(e.target===this)closeLightbox();});
+function playEvent(e){
+  if(!e)return;
+  const metaUrl=e.event_meta_url || (e.event_dir ? e.event_dir+'/event.json' : (e.video_url ? e.video_url.replace(/event\\.mp4$/, 'event.json') : ''));
+  if(metaUrl){
+    fetch('http://'+ip+':7778'+metaUrl)
+      .then(r=>r.json()).then(meta=>playEventFrames({...e,...meta}))
+      .catch(()=>playEventFrames(e));
+  } else {
+    playEventFrames(e);
+  }
+}
+function playEventFrames(e){
+  if(eventPlaybackTimer){clearInterval(eventPlaybackTimer);eventPlaybackTimer=null;}
+  const player=document.getElementById('eventPlayer');
+  player.pause();
+  player.style.display='none';
+  // Prefer mp4 when available; JPEG slideshow is fallback only
+  if(e.video_url){playEventMp4(e.video_url);return;}
+  const framePlayer=document.getElementById('eventFramePlayer');
+  const framesUrl=e.frames_url || (e.event_dir ? e.event_dir+'/frames/' : '');
+  const n=parseInt(e.num_frames||0);
+  const fps=parseFloat(e.record_fps||25);
+  if(!framesUrl || !n){
+    return;
+  }
+  let idx=0;
+  framePlayer.style.display='block';
+  const urls=[];
+  for(let i=0;i<n;i++){
+    urls.push('http://'+ip+':7778'+framesUrl+'frame_'+String(i).padStart(5,'0')+'.jpg');
+  }
+  const cache=urls.map(u=>{const img=new Image(); img.src=u; return img;});
+  const step=()=>{
+    framePlayer.src=cache[idx].src;
+    idx=(idx+1)%n;
+  };
+  step();
+  eventPlaybackTimer=setInterval(step, Math.max(100, 1000/fps));
+}
+function playEventMp4(url){
+  if(!url)return;
+  if(eventPlaybackTimer){clearInterval(eventPlaybackTimer);eventPlaybackTimer=null;}
+  document.getElementById('eventFramePlayer').style.display='none';
+  const player=document.getElementById('eventPlayer');
+  player.style.display='block';
+  player.src='http://'+ip+':7778'+url;
+  player.play().catch(()=>{});
+}
+function thumbForEvent(e){
+  if(e.thumbnail_url)return e.thumbnail_url;
+  if(e.video_url)return e.video_url.replace(/event\\.mp4$/, 'best_frame.jpg');
+  return '';
+}
+
+function toggleMotion(){
+  cfg.motion_enabled=!cfg.motion_enabled;
+  updateMotionBtn();
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({motion_enabled:cfg.motion_enabled})
+  }).catch(e=>setStatus(''+e));
+}
+function applyMotion(){
+  cfg.motion_sensitivity=parseInt(document.getElementById('mth').value);
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({motion_sensitivity:cfg.motion_sensitivity})
+  }).then(()=>setStatus('Motion settings saved.')).catch(e=>setStatus(''+e));
+}
+function updateMotionBtn(){
+  const btn=document.getElementById('btnMotion');
+  if(!btn)return;
+  btn.textContent=cfg.motion_enabled?'Enabled (click to disable)':'Disabled (click to enable)';
+  btn.className=cfg.motion_enabled?'act':'red';
+}
+function applyThresh(){
+  cfg.threshold=parseFloat(document.getElementById('th').value);
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({...cfg,_restart:true})
+  }).then(r=>r.json()).then(()=>setStatus('Detector restarting...')).catch(e=>setStatus(''+e));
+}
+
+function applyMode(){
+  const m=pendingMode;
+  document.getElementById('modeStatus').textContent='switching...';
+  fetch('http://'+ip+':7778/api/mode',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mode:m})
+  }).then(r=>r.json()).then(d=>{
+    cfg.mode=d.mode;
+    document.getElementById('modeStatus').textContent='done';
+    if(d.mode==='ninti'){
+      streamEl.src='http://'+ip+':7778/stream';
+    } else {
+      streamEl.src='';
+      streamEl.alt='RTSP mode - use rtsp://'+ip+':8554/live';
+    }
+    setTimeout(()=>{document.getElementById('modeStatus').textContent='';},3000);
+  }).catch(e=>{document.getElementById('modeStatus').textContent='failed';setStatus(''+e);});
+}
+
+function updateModeLabels(){
+  document.getElementById('lbl_ninti').className=pendingMode==='ninti'?'active':'';
+  document.getElementById('lbl_rtsp').className=pendingMode==='rtsp'?'active':'';
+}
+
+function pollStatus(){
+  function update(){
+    fetch('http://'+ip+':7778/api/status')
+      .then(r=>r.json()).then(s=>{
+        document.getElementById('dotYolo').className='dot '+(s.yolo?'on':'off');
+        document.getElementById('dotRtsp').className='dot '+(s.rtsp?'on':'off');
+        // left state panel
+        const stMode=document.getElementById('stMode');
+        stMode.textContent=s.mode||'-';
+        stMode.className='st-val '+(s.mode==='ninti'?'on':s.mode==='rtsp'?'warn':'');
+        const stY=document.getElementById('stYolo');
+        stY.textContent=s.yolo?'running':'stopped';
+        stY.className='st-val '+(s.yolo?'on':'off');
+        const stR=document.getElementById('stRtsp');
+        if(stR){stR.textContent=s.rtsp?'running':'stopped';
+          stR.className='st-val '+(s.rtsp?'on':'off');}
+        const trackCount=s.tracks||0;
+        document.getElementById('stTracks').textContent=trackCount;
+        document.getElementById('stThresh').textContent=parseFloat(cfg.threshold||0).toFixed(2);
+        const stT=document.getElementById('stTemp');
+        if(s.soc_temp!=null){stT.textContent=s.soc_temp.toFixed(1)+'\\u00b0C';
+          stT.className='st-val '+(s.soc_temp>=85?'warn':s.soc_temp>=75?'warn':'on');}
+        else{stT.textContent='-';stT.className='st-val';}
+        // keep TRACKING node lit while objects are being tracked
+        const tn=document.getElementById('pn-track');
+        if(tn){
+          if(trackCount>0){
+            if(!tn.classList.contains('active')) pnSet('track','active',trackCount+' object'+(trackCount>1?'s':''));
+            else document.getElementById('pi-track').textContent=trackCount+' object'+(trackCount>1?'s':'');
+          } else {
+            pnClear('track');
+          }
+        }
+      }).catch(()=>{});
+  }
+  update();
+  setInterval(update, 3000);
+}
+
+// SSE
+function openSSE(){
+  if(es)es.close();
+  es=new EventSource('http://'+ip+':7778/events');
+  es.onmessage=e=>{try{const d=JSON.parse(e.data);if(d._fps!==undefined)onFps(d);else if(d._active_zone)onActiveZone(d);else if(d._motion)onMotion(d);else if(d._save)onSave(d);else if(d._discard)onDiscard(d);else onDet(d);}catch{}};
+  es.onopen=()=>setStatus('Connected');
+  es.onerror=()=>setStatus('SSE offline, retrying...');
+}
+
+// Pipeline node helpers
+const PIPELINE_NODES=['motion','ai','track','save','discard'];
+const pnTimers={};
+function pnSet(id,cls,info,dur){
+  const el=document.getElementById('pn-'+id);
+  const pi=document.getElementById('pi-'+id);
+  if(!el)return;
+  el.className='pnode '+(cls||'active');
+  if(pi&&info!==undefined)pi.textContent=info;
+  const arr=document.getElementById('pa-'+id);
+  if(arr)arr.className='parrow active';
+  clearTimeout(pnTimers[id]);
+  if(dur){
+    pnTimers[id]=setTimeout(()=>{
+      el.className='pnode';
+      if(arr)arr.className='parrow';
+      if(pi)pi.textContent='';
+    },dur);
+  }
+}
+function pnClear(id){
+  const el=document.getElementById('pn-'+id);
+  const pi=document.getElementById('pi-'+id);
+  const arr=document.getElementById('pa-'+id);
+  if(el)el.className='pnode';
+  if(pi)pi.textContent='';
+  if(arr)arr.className='parrow';
+}
+
+function onFps(d){
+  const el=document.getElementById('stFps');
+  if(el) el.textContent=d._fps.toFixed(1)+' fps';
+}
+function onActiveZone(d){
+  liveActiveZone=d._active_zone;
+  liveActiveZoneTs=Date.now();
+}
+function onDet(d){
+  const log=document.getElementById('log');
+  const ln=document.createElement('div');
+  ln.className='ll';
+  ln.textContent=`${d.cat} ${d.name} ${(d.score*100).toFixed(0)}% (${d.cx.toFixed(2)},${d.cy.toFixed(2)})`;
+  log.appendChild(ln);
+  if(log.children.length>80)log.removeChild(log.firstChild);
+  log.scrollTop=log.scrollHeight;
+  flashes.push({...d,t:Date.now()});
+  const now=new Date();
+  const ts=now.getHours().toString().padStart(2,'0')+':'+
+    now.getMinutes().toString().padStart(2,'0')+':'+
+    now.getSeconds().toString().padStart(2,'0');
+  document.getElementById('stLastDet').textContent=ts+' '+d.name;
+
+  // Drive pipeline states (motion handled separately)
+  const score=(d.score*100).toFixed(0)+'%';
+  const label=d.name+' '+score;
+  pnClear('motion');
+  pnSet('ai','active',label,500);
+  const hits=d.track_hits||1;
+  setTimeout(()=>pnSet('track','active','#'+d.track_id+' hits '+hits, 6000),160);
+}
+
+function onMotion(d){
+  const aiActive=document.getElementById('pn-ai').classList.contains('active');
+  const trActive=document.getElementById('pn-track').classList.contains('active');
+  if(aiActive||trActive) return;
+  pnSet('motion','active',d.pixels+' px',350);
+}
+
+function resetToMotion(){
+  pnClear('ai'); pnClear('track'); pnClear('save'); pnClear('discard');
+  pnSet('motion','active','watching',0);
+}
+
+function onSave(d){
+  pnClear('track');
+  pnClear('ai');
+  pnSet('save','flash-save','#'+d.track_id+' '+d.duration_s+'s',1200);
+  setTimeout(resetToMotion, 1400);
+}
+
+function onDiscard(d){
+  pnClear('track');
+  pnClear('ai');
+  pnSet('discard','flash-discard','#'+d.track_id+' ('+d.hits+'hits)',800);
+  setTimeout(resetToMotion, 1000);
+}
+
+// Canvas
+function syncCvs(){
+  const hlsEl=document.getElementById('hlsPlayer');
+  const activeEl=(_streamMode==='hls'&&hlsEl.videoWidth)?hlsEl:streamEl;
+  const lr=activeEl.getBoundingClientRect();
+  const pr=activeEl.parentElement.getBoundingClientRect();
+  const nw=(activeEl===hlsEl?hlsEl.videoWidth:activeEl.naturalWidth)||640;
+  const nh=(activeEl===hlsEl?hlsEl.videoHeight:activeEl.naturalHeight)||360;
+  // compute actual rendered rect (object-fit:contain inside lr)
+  const scale=Math.min(lr.width/nw, lr.height/nh);
+  const rw=nw*scale, rh=nh*scale;
+  const rx=(lr.width-rw)/2, ry=(lr.height-rh)/2;
+  cvs.width=nw;
+  cvs.height=nh;
+  cvs.style.left=(lr.left-pr.left+rx)+'px';
+  cvs.style.top=(lr.top-pr.top+ry)+'px';
+  cvs.style.width=rw+'px';
+  cvs.style.height=rh+'px';
+}
+streamEl.onload=syncCvs;
+document.getElementById('hlsPlayer').addEventListener('loadedmetadata',syncCvs);
+window.addEventListener('resize',syncCvs);
+
+// stream_yolo emits UDP coordinates in the same rotated space as the MJPEG frame.
+function rawToView(nx,ny){return[nx,ny];}
+function viewToRaw(nx,ny){return[nx,ny];}
+function normToCanvas(nx,ny){
+  const p=rawToView(nx,ny);
+  return[p[0]*cvs.width,p[1]*cvs.height];
+}
+function canvasToNorm(e){
+  const r=cvs.getBoundingClientRect();
+  const vx=(e.clientX-r.left)/r.width, vy=(e.clientY-r.top)/r.height;
+  return viewToRaw(vx,vy);
+}
+function dist(a,b){return Math.hypot(a[0]-b[0],a[1]-b[1]);}
+
+// Detection-zone drag (yellow boxes) -- takes precedence over polygon drawing.
+function eventToPx(e){
+  const [nx,ny]=canvasToNorm(e);
+  return [nx*cfg.sensor_width, ny*cfg.sensor_height];
+}
+function eventToPxOn(e, theCanvas){
+  const r=theCanvas.getBoundingClientRect();
+  const vx=(e.clientX-r.left)/r.width, vy=(e.clientY-r.top)/r.height;
+  const [nx,ny]=viewToRaw(vx,vy);
+  return [nx*cfg.sensor_width, ny*cfg.sensor_height];
+}
+function zoneSize(z){ return z.size||INFER_SZ; }
+// 32 sensor-px handle in the bottom-right corner; returns 'resize' or 'move'.
+function hitDzAt(px,py){
+  const zs=cfg.detection_zones||[];
+  for(let i=zs.length-1;i>=0;i--){
+    // For the active follower (zone 0), hit-test against the visible live
+    // position rather than the static config position, otherwise the user
+    // clicks the orange box and nothing happens.
+    let zx=zs[i].x, zy=zs[i].y, s=zoneSize(zs[i]);
+    if(i===0 && cfg.active_detector && liveActiveZone && !dzCfgDirty){
+      zx=liveActiveZone[0]; zy=liveActiveZone[1]; s=liveActiveZone[2];
+    }
+    if(px>=zx && px<zx+s && py>=zy && py<zy+s){
+      const inHandle = px>=zx+s-32 && py>=zy+s-32;
+      return {idx:i, mode: inHandle?'resize':'move'};
+    }
+  }
+  return null;
+}
+cvs.addEventListener('mousedown',e=>{
+  if(drawing) return;
+  const [px,py]=eventToPx(e);
+  const hit=hitDzAt(px,py);
+  if(!hit) return;
+  const z=cfg.detection_zones[hit.idx];
+  // Active zone hit: snapshot only the live tracked X/Y into config so the
+  // drag operates on the visible position. Size is preserved -- if the user
+  // already resized but hasn't applied, that pending size stays. Suppress
+  // live overrides until apply.
+  if(hit.idx===0 && cfg.active_detector && liveActiveZone){
+    z.x=liveActiveZone[0]; z.y=liveActiveZone[1];
+    dzCfgDirty=true;
+  }
+  if(hit.mode==='resize'){
+    dzDrag={idx:hit.idx, mode:'resize', dragged:false, srcCanvas:cvs};
+  } else {
+    dzDrag={idx:hit.idx, mode:'move', offX:px-z.x, offY:py-z.y, dragged:false, srcCanvas:cvs};
+  }
+  e.preventDefault();
+});
+window.addEventListener('mousemove',e=>{
+  if(!dzDrag) return;
+  const [px,py]=eventToPxOn(e, dzDrag.srcCanvas||cvs);
+  const sw=cfg.sensor_width, sh=cfg.sensor_height;
+  const z=cfg.detection_zones[dzDrag.idx];
+  if(dzDrag.mode==='resize'){
+    let ns=Math.round(Math.min(px-z.x, py-z.y));
+    ns=Math.max(INFER_SZ, ns);  // minimum size only; may exceed frame
+    z.size=ns;
+  } else {
+    let nx=Math.round(px-dzDrag.offX), ny=Math.round(py-dzDrag.offY);
+    z.x=nx; z.y=ny;  // no frame-bound clamping; zone may extend beyond image
+  }
+  dzDrag.dragged=true;
+  renderDzList();
+});
+window.addEventListener('mouseup',()=>{ if(dzDrag) dzDrag=null; });
+
+cvs.addEventListener('mousemove',e=>{if(drawing)hover=canvasToNorm(e);});
+cvs.addEventListener('click',e=>{
+  if(dzDrag) return;  // drag took precedence (mouseup may race)
+  if(!drawing){
+    // Suppress click if it ended a drag
+    const [px,py]=eventToPx(e);
+    if(hitDzAt(px,py)) return;
+    return;
+  }
+  const pt=canvasToNorm(e);
+  if(drawing.pts.length>=3&&dist(pt,drawing.pts[0])<0.04){closeZone();return;}
+  drawing.pts.push(pt);
+});
+cvs.addEventListener('contextmenu',e=>{e.preventDefault();closeZone();});
+
+// Detection-zone CRUD + apply
+function addDetZone(){
+  if(!cfg.detection_zones) cfg.detection_zones=[];
+  if(cfg.detection_zones.length>=MAX_DET_ZONES){setStatus('Max '+MAX_DET_ZONES+' zones.');return;}
+  const sw=cfg.sensor_width, sh=cfg.sensor_height;
+  const cx=Math.round((sw-INFER_SZ)/2), cy=Math.round((sh-INFER_SZ)/2);
+  const off=cfg.detection_zones.length*40;
+  cfg.detection_zones.push({
+    x:Math.max(0,Math.min(cx+off,sw-INFER_SZ)),
+    y:Math.max(0,Math.min(cy+off,sh-INFER_SZ)),
+    size:INFER_SZ});
+  renderDzList();
+}
+function delLastDetZone(){
+  if(!cfg.detection_zones||!cfg.detection_zones.length)return;
+  cfg.detection_zones.pop(); renderDzList();
+}
+function toggleActiveDetector(){
+  if(cfg.active_detector && liveActiveZone && cfg.detection_zones && cfg.detection_zones[0]){
+    cfg.detection_zones[0].x=liveActiveZone[0];
+    cfg.detection_zones[0].y=liveActiveZone[1];
+  }
+  cfg.active_detector=!cfg.active_detector;
+  if(!cfg.active_detector) liveActiveZone=null;
+  const b=document.getElementById('activeBtn');
+  if(b) b.textContent='Zone 1 follower: '+(cfg.active_detector?'ON':'OFF');
+  renderDzList();
+  // apply immediately -- no separate button press needed
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({active_detector:!!cfg.active_detector,_restart:true})
+  }).then(()=>setStatus('Follower '+(cfg.active_detector?'ON':'OFF')+', restarting...'))
+    .catch(e=>setStatus(''+e));
+}
+function renderDzList(){
+  const el=document.getElementById('dzlist');
+  if(!el)return;
+  const zs=cfg.detection_zones||[];
+  if(!zs.length){el.textContent='No zones -- stream_yolo defaults to single center zone.';return;}
+  el.innerHTML=zs.map((z,i)=>{
+    const tag=(i===0 && cfg.active_detector)?' <span style="color:#ff8800">[active]</span>':'';
+    return `<div>#${i+1} at (${z.x},${z.y}) size=${z.size||INFER_SZ}${tag}</div>`;
+  }).join('');
+  const b=document.getElementById('activeBtn');
+  if(b) b.textContent='Zone 1 follower: '+(cfg.active_detector?'ON':'OFF');
+}
+function applyAll(){
+  const sr=document.getElementById('senRes').value.split(',');
+  cfg.sensor_width=parseInt(sr[0]);
+  cfg.sensor_height=parseInt(sr[1]);
+  const sw=cfg.sensor_width, sh=cfg.sensor_height;
+  (cfg.detection_zones||[]).forEach(z=>{
+    z.size=Math.max(INFER_SZ,z.size||INFER_SZ);  // minimum size only; zone may exceed frame
+  });
+  cfg.target_fps=parseInt(document.getElementById('fpsCap').value);
+  cfg.threshold=parseFloat(document.getElementById('th').value);
+  cfg.motion_sensitivity=parseInt(document.getElementById('mth').value);
+  renderDzList();
+  const btns=document.querySelectorAll('.apply-all-btn');
+  btns.forEach(b=>{b.disabled=true;b.textContent='Applying...';});
+  fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(cfg)
+  }).then(()=>{
+    dzCfgDirty=false;
+    setStatus('Saved. Reboot to apply hardware changes.');
+    btns.forEach(b=>{b.disabled=false;b.textContent='Apply';});
+  }).catch(e=>{
+    setStatus(''+e);
+    btns.forEach(b=>{b.disabled=false;b.textContent='Apply';});
+  });
+}
+function applyDetector(){applyAll();}
+
+function newZone(){
+  const name=document.getElementById('zname').value.trim()||('Zone '+(cfg.zones.length+1));
+  drawing={name,pts:[]};
+  setStatus('Click on stream to add points. Right-click or click near start to finish.');
+}
+function cancelZone(){drawing=null;hover=null;setStatus('');}
+function closeZone(){
+  if(!drawing||drawing.pts.length<3){cancelZone();return;}
+  cfg.zones.push({name:drawing.name,enabled:true,points:drawing.pts});
+  drawing=null;hover=null;
+  renderZones();
+  setStatus('Zone added.');
+}
+
+// Render loop
+function frame(){
+  syncCvs();
+  const W=cvs.width,H=cvs.height;
+  ctx.clearRect(0,0,W,H);
+
+  // Detection zones (yellow dashed normal; orange when zone 0 is active follower).
+  // While stream_yolo is reporting live _active_zone, zone 0 renders at the
+  // tracked position instead of the config position.
+  const sw=cfg.sensor_width||1280, sh=cfg.sensor_height||720;
+  (cfg.detection_zones||[]).forEach((z,i)=>{
+    const isActive=(i===0 && !!cfg.active_detector);
+    const dragging=dzDrag&&dzDrag.idx===i;
+    let zx=z.x, zy=z.y, zs=z.size||INFER_SZ;
+    // Show live position only when active and the user isn't editing.
+    if(isActive && liveActiveZone && !dragging && !dzCfgDirty){
+      zx=liveActiveZone[0]; zy=liveActiveZone[1]; zs=liveActiveZone[2];
+    }
+    const x=zx*W/sw, y=zy*H/sh;
+    const w=zs*W/sw, h=zs*H/sh;
+    const col=isActive?'#ff8800':'#ffcc00';
+    ctx.setLineDash([8,4]);
+    ctx.strokeStyle=dragging?'#ff0':col;
+    ctx.lineWidth=dragging?3:2;
+    ctx.strokeRect(x,y,w,h);
+    ctx.setLineDash([]);
+    ctx.fillStyle=isActive?'rgba(255,136,0,0.10)':'rgba(255,204,0,0.10)';
+    ctx.fillRect(x,y,w,h);
+    // Resize handle (right-bottom corner) -- 32 sensor px -> scale
+    const hsx=Math.max(4, 32*W/sw), hsy=Math.max(4, 32*H/sh);
+    ctx.fillStyle=col;
+    ctx.fillRect(x+w-hsx, y+h-hsy, hsx, hsy);
+    ctx.font='11px monospace';
+    ctx.fillText('zone '+(i+1)+(isActive?' [active]':'')+' ('+zx+','+zy+') sz='+zs, x+4, y+13);
+  });
+
+  cfg.zones.forEach((z,i)=>{
+    if(!z.points||z.points.length<2)return;
+    const col=PALETTE[i%PALETTE.length];
+    ctx.beginPath();
+    const[x0,y0]=normToCanvas(z.points[0][0],z.points[0][1]);
+    ctx.moveTo(x0,y0);
+    z.points.slice(1).forEach(p=>{const[x,y]=normToCanvas(p[0],p[1]);ctx.lineTo(x,y);});
+    ctx.closePath();
+    ctx.strokeStyle=col; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle=col+'28'; ctx.fill();
+    ctx.fillStyle=col; ctx.font='11px monospace';
+    ctx.fillText(z.name,x0+3,y0-4);
+    if(!z.enabled){ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fill();}
+  });
+  if(drawing&&drawing.pts.length>0){
+    ctx.setLineDash([5,4]);
+    ctx.strokeStyle='#fff'; ctx.lineWidth=1.5;
+    ctx.beginPath();
+    const[x0,y0]=normToCanvas(drawing.pts[0][0],drawing.pts[0][1]);
+    ctx.moveTo(x0,y0);
+    drawing.pts.slice(1).forEach(p=>{const[x,y]=normToCanvas(p[0],p[1]);ctx.lineTo(x,y);});
+    if(hover){const[hx,hy]=normToCanvas(hover[0],hover[1]);ctx.lineTo(hx,hy);}
+    ctx.stroke(); ctx.setLineDash([]);
+    drawing.pts.forEach((p,i)=>{
+      const[x,y]=normToCanvas(p[0],p[1]);
+      ctx.beginPath(); ctx.arc(x,y,i===0?6:3,0,2*Math.PI);
+      ctx.fillStyle=i===0?'#ff0':'#fff'; ctx.fill();
+    });
+  }
+  const now=Date.now();
+  flashes=flashes.filter(d=>now-d.t<800);
+  flashes.forEach(d=>{
+    const a=1-(now-d.t)/800;
+    const x1=d.x1/d.fw*W,y1=d.y1/d.fh*H,x2=d.x2/d.fw*W,y2=d.y2/d.fh*H;
+    ctx.strokeStyle=`rgba(0,255,0,${a})`; ctx.lineWidth=2;
+    ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+    ctx.fillStyle=`rgba(0,255,0,${a})`; ctx.font='11px monospace';
+    ctx.fillText(`${d.name} ${(d.score*100).toFixed(0)}%`,x1,y1>14?y1-3:y1+13);
+  });
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function renderZones(){
+  const el=document.getElementById('zlist');
+  el.innerHTML='';
+  if(!cfg.zones.length){el.innerHTML='<div class="hint">No zones (all area active)</div>';return;}
+  cfg.zones.forEach((z,i)=>{
+    const d=document.createElement('div');d.className='zi';
+    const col=PALETTE[i%PALETTE.length];
+    d.innerHTML=`<div class="row"><span class="zn" style="color:${col}">${z.name}</span>
+      <span class="hint" style="flex:1"> ${z.points.length}pts</span>
+      <button onclick="toggleZ(${i})">${z.enabled?'On':'Off'}</button>
+      <button class="red" onclick="delZ(${i})">Del</button></div>`;
+    el.appendChild(d);
+  });
+}
+function toggleZ(i){cfg.zones[i].enabled=!cfg.zones[i].enabled;renderZones();}
+function delZ(i){cfg.zones.splice(i,1);renderZones();}
+
+const ALL_CLASSES=['person','vehicle','animal','bird','cat','dog','horse','sheep','cow','bear'];
+function renderClasses(){
+  const el=document.getElementById('fclasses');
+  el.innerHTML='';
+  ALL_CLASSES.forEach(c=>{
+    const chk=cfg.filter_classes.includes(c);
+    const d=document.createElement('label');
+    d.style.cssText='display:flex;align-items:center;gap:4px;margin:2px 0;cursor:pointer';
+    d.innerHTML=`<input type="checkbox" ${chk?'checked':''} onchange="toggleClass('${c}',this.checked)"> ${c}`;
+    el.appendChild(d);
+  });
+}
+function toggleClass(c,on){
+  if(on&&!cfg.filter_classes.includes(c))cfg.filter_classes.push(c);
+  if(!on)cfg.filter_classes=cfg.filter_classes.filter(x=>x!==c);
+}
+
+function rebootDevice(){
+  if(!confirm('Reboot device?')) return;
+  fetch('http://'+getip()+':7778/api/reboot',{method:'POST'})
+    .then(()=>setStatus('Rebooting... (~45s)'))
+    .catch(()=>setStatus('Rebooting...'));
+}
+function setStatus(msg){
+  document.getElementById('status').textContent=msg;
+  if(msg)setTimeout(()=>{if(document.getElementById('status').textContent===msg)
+    document.getElementById('status').textContent='';},4000);
+}
+
+function showMainTab(name, btn){
+  const wasLive = document.getElementById('main-live').classList.contains('active');
+  document.querySelectorAll('.nav-tab').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.main-tab').forEach(p=>p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('main-'+name).classList.add('active');
+  if(name==='events') loadEvents();
+  // leaving live tab: tear down HLS so buffer doesn't accumulate
+  if(wasLive && name!=='live' && _streamMode==='hls') {
+    if(_hlsObj){ _hlsObj.destroy(); _hlsObj=null; }
+    const hlsEl=document.getElementById('hlsPlayer');
+    hlsEl.pause(); hlsEl.src='';
+  }
+  // returning to live tab: restart HLS fresh from live edge
+  if(!wasLive && name==='live' && _streamMode==='hls') {
+    setStream('hls');
+  }
+}
+
+if(document.getElementById('ip').value) connect();
+
+// ---- HLS player (rotation handled by VPSS hardware: bMirror+bFlip in capture_cvi.cpp) ----
+function setStream(mode) {
+  const ip      = document.getElementById('ip').value.trim();
+  const mjpegEl = document.getElementById('stream');
+  const hlsEl   = document.getElementById('hlsPlayer');
+  _streamMode = mode;
+  if (mode === 'hls') {
+    mjpegEl.src = ''; mjpegEl.style.display = 'none';
+    hlsEl.style.display = 'block';
+    const hlsUrl = 'http://' + ip + ':7778/hls/live.m3u8';
+    if (window.Hls && Hls.isSupported()) {
+      if (_hlsObj) _hlsObj.destroy();
+      _hlsObj = new Hls({
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 6,
+        maxBufferLength: 20,
+        maxMaxBufferLength: 20,
+        lowLatencyMode: false,
+      });
+      _hlsObj.loadSource(hlsUrl);
+      _hlsObj.attachMedia(hlsEl);
+      _hlsObj.on(Hls.Events.MANIFEST_PARSED, () => hlsEl.play().catch(()=>{}));
+    } else if (hlsEl.canPlayType('application/vnd.apple.mpegurl')) {
+      hlsEl.src = hlsUrl; hlsEl.play().catch(()=>{});
+    }
+  } else {
+    if (_hlsObj) { _hlsObj.destroy(); _hlsObj = null; }
+    hlsEl.src = ''; hlsEl.style.display = 'none';
+    mjpegEl.style.display = '';
+    mjpegEl.src = 'http://' + ip + ':7778/stream';
+  }
+}
+</script>
+</body>
+</html>
