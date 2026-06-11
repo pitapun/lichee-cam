@@ -29,6 +29,7 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 .zp-section h3{font-size:10px;color:#555;letter-spacing:.08em;text-transform:uppercase;margin-bottom:2px}
 #pipeline-panel{width:176px;flex:0 0 176px;padding:12px 10px;background:#141414;display:flex;flex-direction:column;border-right:1px solid #2a2a2a;overflow-y:auto;font-size:12px}
 .panel-head{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:4px;margin-bottom:10px;letter-spacing:.1em;text-transform:uppercase}
+#live-video-slot,#zone-video-slot{flex:1;min-width:0;position:relative;display:flex}
 #stream-area{flex:1;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}
 #stream{display:block;width:100%;height:100%;object-fit:contain;image-rendering:pixelated}
 #hlsPlayer{display:none;width:100%;height:100%;object-fit:contain}
@@ -131,6 +132,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   <span id="nav-brand">NINTIDETECT</span>
   <div id="nav-tabs">
     <button class="nav-tab active" onclick="showMainTab('live',this)">&#9654; Live</button>
+    <button class="nav-tab" onclick="showMainTab('zone',this)">Zone</button>
     <button class="nav-tab" onclick="showMainTab('events',this)">Events</button>
     <button class="nav-tab" onclick="showMainTab('settings',this)">Settings</button>
   </div>
@@ -177,15 +179,9 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
         </div>
       </div>
     </div>
-    <div class="pstat">
-      <div class="st-row"><span class="st-label">detector</span><span class="st-val off" id="stYolo">-</span></div>
-      <div class="st-row"><span class="st-label">tracks</span><span class="st-val" id="stTracks">0</span></div>
-      <div class="st-row"><span class="st-label">threshold</span><span class="st-val" id="stThresh">-</span></div>
-      <div class="st-row"><span class="st-label">fps</span><span class="st-val" id="stFps">-</span></div>
-      <div class="st-row"><span class="st-label">last det</span><span class="st-val" id="stLastDet" style="font-size:10px;line-height:1.4">-</span></div>
-    </div>
   </div>
 
+  <div id="live-video-slot">
   <div id="stream-area">
     <img id="stream" src="" alt="stream offline">
     <video id="hlsPlayer" muted autoplay playsinline style="display:none"></video>
@@ -196,8 +192,22 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
       <button onclick="setStream('mjpeg')" id="btnMjpeg">MJPEG</button>
     </div>
   </div>
+  </div>
 
+</div>
+
+<!-- -- Tab 2: Zone -- -->
+<div class="main-tab" id="main-zone">
+  <div id="zone-video-slot"></div>
   <div id="zone-panel">
+    <div class="zp-section">
+      <div class="panel-head">Status</div>
+      <div class="st-row"><span class="st-label">detector</span><span class="st-val off" id="stYolo">-</span></div>
+      <div class="st-row"><span class="st-label">tracks</span><span class="st-val" id="stTracks">0</span></div>
+      <div class="st-row"><span class="st-label">threshold</span><span class="st-val" id="stThresh">-</span></div>
+      <div class="st-row"><span class="st-label">fps</span><span class="st-val" id="stFps">-</span></div>
+      <div class="st-row"><span class="st-label">last det</span><span class="st-val" id="stLastDet" style="font-size:10px;line-height:1.4">-</span></div>
+    </div>
     <div class="zp-section">
       <div class="panel-head">Detection Zones</div>
       <button onclick="addDetZone()" style="width:100%">+ Add zone</button>
@@ -220,7 +230,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
 
 </div>
 
-<!-- -- Tab 2: Events -- -->
+<!-- -- Tab 3: Events -- -->
 <div class="main-tab" id="main-events">
   <div id="ev-toolbar">
     <span class="ev-title">Events</span>
@@ -240,7 +250,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   <div id="ev-meta"></div>
 </div>
 
-<!-- -- Tab 3: Settings -- -->
+<!-- -- Tab 4: Settings -- -->
 <div class="main-tab" id="main-settings">
 <div id="settings-inner">
 
@@ -1174,20 +1184,29 @@ function setStatus(msg){
 }
 
 function showMainTab(name, btn){
-  const wasLive = document.getElementById('main-live').classList.contains('active');
+  const isVideoTab = name==='live' || name==='zone';
+  const wasVideoTab =
+    document.getElementById('main-live').classList.contains('active') ||
+    document.getElementById('main-zone').classList.contains('active');
   document.querySelectorAll('.nav-tab').forEach(b=>b.classList.remove('active'));
   document.querySelectorAll('.main-tab').forEach(p=>p.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('main-'+name).classList.add('active');
+  if(isVideoTab){
+    const slot=document.getElementById(name==='zone'?'zone-video-slot':'live-video-slot');
+    const streamArea=document.getElementById('stream-area');
+    if(slot && streamArea && streamArea.parentElement!==slot) slot.appendChild(streamArea);
+    requestAnimationFrame(syncCvs);
+  }
   if(name==='events') loadEvents();
-  // leaving live tab: tear down HLS so buffer doesn't accumulate
-  if(wasLive && name!=='live' && _streamMode==='hls') {
+  // leaving video tabs: tear down HLS so buffer doesn't accumulate
+  if(wasVideoTab && !isVideoTab && _streamMode==='hls') {
     if(_hlsObj){ _hlsObj.destroy(); _hlsObj=null; }
     const hlsEl=document.getElementById('hlsPlayer');
     hlsEl.pause(); hlsEl.src='';
   }
-  // returning to live tab: restart HLS fresh from live edge
-  if(!wasLive && name==='live' && _streamMode==='hls') {
+  // returning to a video tab: restart HLS fresh from live edge
+  if(!wasVideoTab && isVideoTab && _streamMode==='hls') {
     setStream('hls');
   }
 }
