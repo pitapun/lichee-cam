@@ -321,10 +321,10 @@ def _mqtt_discovery_messages():
             'value_template': '{{ value_json.name }}',
             'json_attributes_topic': f'{base}/last/vehicle',
         }),
-        ('sensor', 'last_animal_event', {
-            'name': 'Last Animal Event', 'state_topic': f'{base}/last/animal',
+        ('sensor', 'last_other_event', {
+            'name': 'Last Other Event', 'state_topic': f'{base}/last/other',
             'value_template': '{{ value_json.name }}',
-            'json_attributes_topic': f'{base}/last/animal',
+            'json_attributes_topic': f'{base}/last/other',
         }),
         ('binary_sensor', 'detector', {
             'name': 'Detector', 'state_topic': f'{base}/status',
@@ -343,6 +343,7 @@ def _mqtt_discovery_messages():
         payload['unique_id'] = f'nintidetect_195_{key}'
         payload['object_id'] = f'nintidetect_195_{key}'
         msgs.append((f'{prefix}/{domain}/nintidetect_195/{key}/config', payload, True))
+    msgs.append((f'{prefix}/sensor/nintidetect_195/last_animal_event/config', '', True))
     return msgs
 
 def mqtt_publish_discovery(force=False):
@@ -453,18 +454,19 @@ def _last_event_by_category_payload():
                 except Exception:
                     continue
                 cat = rec.get('cat')
-                if cat not in ('person', 'vehicle', 'animal'):
-                    continue
+                cat_key = cat if cat in ('person', 'vehicle') else 'other'
                 if not rec.get('video_url') and not rec.get('thumbnail_url'):
                     continue
-                latest[cat] = _event_item(rec)
+                item = _event_item(rec)
+                item['cat'] = cat_key
+                latest[cat_key] = item
     except Exception:
         pass
     empty = lambda cat: {
         'cat': cat, 'name': 'none', 'thumbnail_url': '', 'thumbnail_url_abs': '',
         'video_url': '', 'video_url_abs': '', 'ts': time.time(),
     }
-    return {cat: latest.get(cat) or empty(cat) for cat in ('person', 'vehicle', 'animal')}
+    return {cat: latest.get(cat) or empty(cat) for cat in ('person', 'vehicle', 'other')}
 
 def mqtt_publish_recent_events():
     mc = _mqtt_enabled_cfg()
@@ -476,7 +478,8 @@ def mqtt_publish_recent_events():
         (f"{mc['base']}/recent_events", _recent_events_payload(3), True),
         (f"{mc['base']}/last/person", by_cat['person'], True),
         (f"{mc['base']}/last/vehicle", by_cat['vehicle'], True),
-        (f"{mc['base']}/last/animal", by_cat['animal'], True),
+        (f"{mc['base']}/last/other", by_cat['other'], True),
+        (f"{mc['base']}/last/animal", '', True),
     ])
 
 # ---- Point-in-polygon (ray casting) ----
