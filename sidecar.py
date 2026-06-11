@@ -565,12 +565,11 @@ def _expire_tracks(now=None):
     with tracks_lock:
         for tid, tr in list(tracks.items()):
             recording = tid in recording_ids
-            # While a recorder is active, only use LOST check (not STILL) and
-            # extend the timeout so track_id stays stable across the event.
-            # This prevents the track from dying mid-event while inference is
-            # paused in captureRaw mode.
+            # While a recorder is active, only use LOST check (not STILL).
+            # Detection pauses during recording, so LOST also acts as the
+            # event recording timeout after min_record_until.
             if recording:
-                lost  = now - tr.get('last_seen', now) > TRACK_LOST_TIMEOUT * 10
+                lost  = now - tr.get('last_seen', now) > TRACK_LOST_TIMEOUT
                 still = False
             else:
                 lost  = now - tr.get('last_seen',  now) > TRACK_LOST_TIMEOUT

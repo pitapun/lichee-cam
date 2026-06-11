@@ -836,7 +836,7 @@ int main(int argc, char *argv[]) {
         // Pull raw VI frames and feed hardware VENC directly, avoiding VPSS/BGR,
         // JPEG, motion detection, and NPU work while the clip is being written.
         std::string raw_requested_hd_dir = read_hd_record_dir();
-        if (!raw_requested_hd_dir.empty() || !hd_record_dir.empty()) {
+        if (false && (!raw_requested_hd_dir.empty() || !hd_record_dir.empty())) {
             // Keep HLS VENC running (CHN0 idle is fine) — don't stop/restart it
             // since CreateChn during captureRaw causes VI pipeline stalls.
             VIDEO_FRAME_INFO_S* raw_frame = (VIDEO_FRAME_INFO_S*)cap.captureRaw();
