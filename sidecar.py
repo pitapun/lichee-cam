@@ -122,6 +122,10 @@ def _ws_status_loop():
     while True:
         time.sleep(1.0)
         try:
+            # Drive track expiry even when captureRaw mode suppresses UDP detections.
+            # During events, stream_yolo sends only _fps/_status UDP which don't call
+            # _expire_tracks(), so we must do it here to enforce the extended timeout.
+            _expire_tracks()
             soc_temp = None
             try:
                 with open('/sys/class/thermal/thermal_zone0/temp') as _t:
