@@ -9,6 +9,7 @@ NintiDetect sidecar
 """
 
 import json, os, shutil, subprocess, threading, time, socket, sys, io, collections
+import hashlib, base64
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from queue import Queue, Empty
@@ -77,6 +78,71 @@ stream_clients = 0
 PRE_BUFFER_SECS = 2.0
 _pre_buf = collections.deque()  # (t, jpg_bytes) — rolling 3s window
 _pre_buf_lock = threading.Lock()
+
+# ---- WebSocket state ----
+_ws_clients = []          # list of Queue objects
+_ws_clients_lock = threading.Lock()
+_ws_state = {}            # latest status fields from stream_yolo (_status UDP msgs)
+
+
+def _ws_frame(data):
+    """Encode payload as a WebSocket text frame (opcode=0x1, FIN set)."""
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    length = len(data)
+    hdr = bytearray([0x81])
+    if length < 126:
+        hdr.append(length)
+    elif length < 65536:
+        hdr.append(126)
+        hdr.extend(length.to_bytes(2, 'big'))
+    else:
+        hdr.append(127)
+        hdr.extend(length.to_bytes(8, 'big'))
+    return bytes(hdr) + data
+
+
+def _ws_broadcast(msg):
+    if isinstance(msg, dict):
+        msg = json.dumps(msg, separators=(',', ':'))
+    frame = _ws_frame(msg)
+    with _ws_clients_lock:
+        dead = []
+        for q in _ws_clients:
+            try:
+                q.put_nowait(frame)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            try: _ws_clients.remove(q)
+            except ValueError: pass
+
+
+def _ws_status_loop():
+    while True:
+        time.sleep(1.0)
+        try:
+            soc_temp = None
+            try:
+                with open('/sys/class/thermal/thermal_zone0/temp') as _t:
+                    soc_temp = round(int(_t.read().strip()) / 1000.0, 1)
+            except Exception:
+                pass
+            with tracks_lock:
+                n_tracks = len(tracks)
+            with recorders_lock:
+                n_events = len(event_recorders)
+            status = {
+                'ts': time.time(),
+                'type': 'status',
+                'soc_temp': soc_temp,
+                'tracks': n_tracks,
+                'events': n_events,
+            }
+            status.update(_ws_state)
+            _ws_broadcast(status)
+        except Exception:
+            pass
 
 TRACK_IOU_THRESHOLD = 0.20
 TRACK_CENTER_THRESHOLD = 0.25
@@ -487,11 +553,24 @@ def _finish_event_video(tr, save, now):
 def _expire_tracks(now=None):
     if now is None:
         now = time.time()
+    # Snapshot which tracks have active recorders before taking tracks_lock,
+    # so _finish_event_video can safely acquire recorders_lock later.
+    with recorders_lock:
+        recording_ids = set(event_recorders.keys())
     expired = []
     with tracks_lock:
         for tid, tr in list(tracks.items()):
-            lost  = now - tr.get('last_seen',  now) > TRACK_LOST_TIMEOUT
-            still = now - tr.get('last_moved', now) > TRACK_STILL_TIMEOUT
+            recording = tid in recording_ids
+            # While a recorder is active, only use LOST check (not STILL) and
+            # extend the timeout so track_id stays stable across the event.
+            # This prevents the track from dying mid-event while inference is
+            # paused in captureRaw mode.
+            if recording:
+                lost  = now - tr.get('last_seen', now) > TRACK_LOST_TIMEOUT * 10
+                still = False
+            else:
+                lost  = now - tr.get('last_seen',  now) > TRACK_LOST_TIMEOUT
+                still = now - tr.get('last_moved', now) > TRACK_STILL_TIMEOUT
             if (lost or still) and now >= tr.get('min_record_until', 0):
                 expired.append(tid)
         for tid in expired:
@@ -884,6 +963,9 @@ def udp_listener():
             continue
         try:
             det = json.loads(data)
+            if '_status' in det:
+                _ws_state.update({k: v for k, v in det.items() if k != '_status'})
+                continue
             if '_fps' in det or '_active_zone' in det:
                 msg = 'data: ' + json.dumps(det) + '\n\n'
                 for q in list(sse_clients):
@@ -905,6 +987,7 @@ def udp_listener():
                 except: dead.append(q)
             for q in dead:
                 if q in sse_clients: sse_clients.remove(q)
+            _ws_broadcast({'type': 'det', **det})
         except Exception:
             pass
 
@@ -2278,9 +2361,44 @@ class Handler(BaseHTTPRequestHandler):
                 try: sse_clients.remove(q)
                 except ValueError: pass
 
+        elif path == '/ws':
+            self._handle_ws()
+
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_ws(self):
+        key = self.headers.get('Sec-WebSocket-Key', '')
+        if not key or self.headers.get('Upgrade', '').lower() != 'websocket':
+            self.send_response(400); self.end_headers(); return
+        accept = base64.b64encode(
+            hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()
+        ).decode()
+        resp = (
+            'HTTP/1.1 101 Switching Protocols\r\n'
+            'Upgrade: websocket\r\n'
+            'Connection: Upgrade\r\n'
+            f'Sec-WebSocket-Accept: {accept}\r\n'
+            '\r\n'
+        )
+        self.connection.sendall(resp.encode())
+        q = Queue()
+        with _ws_clients_lock:
+            _ws_clients.append(q)
+        try:
+            while True:
+                try:
+                    frame = q.get(timeout=30)
+                    self.connection.sendall(frame)
+                except Empty:
+                    self.connection.sendall(bytes([0x89, 0x00]))  # ping
+        except Exception:
+            pass
+        finally:
+            with _ws_clients_lock:
+                try: _ws_clients.remove(q)
+                except ValueError: pass
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -2376,6 +2494,7 @@ if __name__ == '__main__':
     threading.Thread(target=_watchdog, daemon=True).start()
     threading.Thread(target=_motion_detector, daemon=True).start()
     threading.Thread(target=_storage_cleanup_loop, daemon=True).start()
+    threading.Thread(target=_ws_status_loop, daemon=True).start()
 
     # Apply saved mode on startup
     saved_mode = cfg.get('mode', 'ninti')

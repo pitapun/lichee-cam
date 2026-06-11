@@ -892,6 +892,10 @@ int main(int argc, char *argv[]) {
                 acc_cap=acc_motion=acc_infer=acc_nms_draw=acc_mjpeg=0;
                 snprintf(buf, sizeof(buf), "{\"_fps\":%.1f}", fps);
                 udp_send(buf);
+                snprintf(buf, sizeof(buf),
+                    "{\"_status\":1,\"fps\":%.1f,\"venc\":%d,\"chn1\":%d,\"mode\":\"raw\"}",
+                    fps, (int)hlsrec.is_venc_active(), (int)h264rec.is_active());
+                udp_send(buf);
                 fps_frames = 0;
                 fps_last = now;
             }
@@ -1129,6 +1133,10 @@ int main(int argc, char *argv[]) {
             acc_cap=acc_motion=acc_infer=acc_nms_draw=acc_mjpeg=0;
             acc_clone=acc_hls_send=0;
             snprintf(buf, sizeof(buf), "{\"_fps\":%.1f}", fps);
+            udp_send(buf);
+            snprintf(buf, sizeof(buf),
+                "{\"_status\":1,\"fps\":%.1f,\"venc\":%d,\"chn1\":%d,\"npu\":%d,\"mode\":\"normal\"}",
+                fps, (int)hlsrec.is_venc_active(), (int)h264rec.is_active(), (int)npu_active);
             udp_send(buf);
             fps_frames = 0;
             fps_last = now;

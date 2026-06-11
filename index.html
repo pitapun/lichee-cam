@@ -140,6 +140,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
     <span id="status"></span>
   </div>
 </div>
+<div id="diag-overlay" style="position:fixed;bottom:6px;right:8px;font-family:monospace;font-size:10px;color:#555;z-index:999;pointer-events:none;background:rgba(0,0,0,.5);padding:3px 6px;border-radius:2px"></div>
 
 <!-- -- Tab 1: Live -- -->
 <div class="main-tab active" id="main-live">
@@ -367,6 +368,7 @@ function connect(){
   loadConf();
   loadEvents();
   openSSE();
+  openWS();
   pollStatus();
   setInterval(loadEvents, 5000);
   setStream('hls');
@@ -623,6 +625,34 @@ function openSSE(){
   es.onmessage=e=>{try{const d=JSON.parse(e.data);if(d._fps!==undefined)onFps(d);else if(d._active_zone)onActiveZone(d);else if(d._motion)onMotion(d);else if(d._save)onSave(d);else if(d._discard)onDiscard(d);else onDet(d);}catch{}};
   es.onopen=()=>setStatus('Connected');
   es.onerror=()=>setStatus('SSE offline, retrying...');
+}
+
+// WebSocket diagnostic stream
+let ws=null, wsRetry=null;
+function openWS(){
+  if(ws){try{ws.close();}catch(e){}}
+  ws=new WebSocket('ws://'+ip+':7778/ws');
+  ws.onmessage=e=>{try{onWsMsg(JSON.parse(e.data));}catch(e){}};
+  ws.onclose=()=>{wsRetry=setTimeout(openWS,5000);};
+  ws.onerror=()=>{try{ws.close();}catch(e){}};
+}
+function onWsMsg(d){
+  if(d.type==='status'){
+    // update diag overlay
+    const o=document.getElementById('diag-overlay');
+    if(!o)return;
+    const val=(k,fmt)=>{const v=d[k];return v==null?'?':(fmt?fmt(v):v);};
+    const f=(v,ok)=>`<span style="color:${ok?'#0f0':'#fa5'}">${v}</span>`;
+    const mode=d.mode||'?';
+    o.innerHTML=
+      f(val('fps',v=>v.toFixed(1)+' fps'), true)+' | '+
+      f(val('soc_temp',v=>v.toFixed(1)+'°C'), d.soc_temp==null||d.soc_temp<80)+' | '+
+      'venc:'+f(d.venc?'on':'off',d.venc)+' '+
+      'chn1:'+f(d.chn1?'rec':'idle',!d.chn1)+' '+
+      (d.npu!=null?'npu:'+f(d.npu?'on':'off',d.npu)+' ':'')+
+      'trk:'+val('tracks')+' evts:'+val('events')+
+      ' <span style="color:#444">'+mode+'</span>';
+  }
 }
 
 // Pipeline node helpers
