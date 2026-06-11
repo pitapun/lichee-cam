@@ -1309,6 +1309,7 @@ def udp_listener():
 
 # ---- HTML served from index.html (read from disk each request) ----
 _INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html')
+_HA_STREAM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ha-stream.html')
 
 def _read_index_html():
     try:
@@ -1316,6 +1317,13 @@ def _read_index_html():
             return f.read()
     except Exception:
         return b'<h1>index.html not found</h1>'
+
+def _read_ha_stream_html():
+    try:
+        with open(_HA_STREAM_PATH, 'rb') as f:
+            return f.read()
+    except Exception:
+        return b'<h1>ha-stream.html not found</h1>'
 
 if False:
     HTML = b'''<!DOCTYPE html>
@@ -2530,6 +2538,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif path == '/ha-stream.html':
+            body = _read_ha_stream_html()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-cache')
             self.end_headers()
             self.wfile.write(body)
 
