@@ -24,19 +24,22 @@ function play(){
   if(hls){hls.destroy();hls=null;}
   if(window.Hls&&Hls.isSupported()){
     hls=new Hls({
-      lowLatencyMode:true,
-      liveSyncDurationCount:2,
-      liveMaxLatencyDurationCount:4,
-      maxLiveSyncPlaybackRate:1.5,
-      backBufferLength:10,
-      enableWorker:true
+      liveSyncDurationCount:3,
+      liveMaxLatencyDurationCount:6,
+      maxBufferLength:20,
+      maxMaxBufferLength:20,
+      lowLatencyMode:false
     });
     hls.loadSource(src);
     hls.attachMedia(video);
     hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().then(()=>status('live')).catch(()=>status('tap to play')));
     hls.on(Hls.Events.ERROR,(ev,data)=>{
       status(data&&data.details?data.details:'stream error');
-      if(data&&data.fatal)setTimeout(play,1000);
+      if(data&&data.fatal&&data.type===Hls.ErrorTypes.MEDIA_ERROR){
+        hls.recoverMediaError();
+      }else if(data&&data.fatal){
+        setTimeout(play,2000);
+      }
     });
   }else if(video.canPlayType('application/vnd.apple.mpegurl')){
     video.src=src;
@@ -46,7 +49,6 @@ function play(){
   }
 }
 video.addEventListener('click',()=>video.play().catch(()=>{}));
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)play();});
 play();
 </script>
 </body>
