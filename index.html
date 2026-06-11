@@ -253,6 +253,39 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   </div>
 
   <div class="s-section">
+    <h2>Home Assistant MQTT</h2>
+    <div class="s-row">
+      <button id="btnMqtt" onclick="toggleMqtt()" style="flex:1">Disabled</button>
+      <button onclick="testMqtt()">Test</button>
+    </div>
+    <div class="s-row">
+      <span class="s-label">Host</span>
+      <input id="mqttHost" type="text" placeholder="192.168.100.10" style="flex:1">
+      <input id="mqttPort" type="text" value="1883" style="width:70px">
+    </div>
+    <div class="s-row">
+      <span class="s-label">User</span>
+      <input id="mqttUser" type="text" placeholder="username" style="flex:1">
+    </div>
+    <div class="s-row">
+      <span class="s-label">Password</span>
+      <input id="mqttPass" type="password" placeholder="leave blank to keep current" style="flex:1">
+    </div>
+    <div class="s-row">
+      <span class="s-label">Base topic</span>
+      <input id="mqttBase" type="text" value="nintidetect/195" style="flex:1">
+    </div>
+    <div class="s-row">
+      <span class="s-label">Device</span>
+      <input id="mqttName" type="text" value="NintiDetect 195" style="flex:1">
+    </div>
+    <div class="s-row">
+      <button onclick="applyMqtt()" class="act" style="flex:1">Save MQTT</button>
+      <span class="hint" id="mqttStatus"></span>
+    </div>
+  </div>
+
+  <div class="s-section">
     <h2>Mode</h2>
     <div class="mode-radio" id="modeRadio">
       <label id="lbl_ninti"><input type="radio" name="mode" value="ninti" onchange="pendingMode='ninti';updateModeLabels()"> NintiDetect</label>
@@ -341,7 +374,9 @@ let liveActiveZoneTs=0;
 // (i.e. once the new value has been sent to stream_yolo).
 let dzCfgDirty=false;
 let cfg={mode:'ninti',threshold:0.45,zones:[],filter_classes:['person','vehicle','animal'],
-         detection_zones:[],active_detector:false,sensor_width:1280,sensor_height:720};
+         detection_zones:[],active_detector:false,sensor_width:1280,sensor_height:720,
+         mqtt_enabled:false,mqtt_host:'',mqtt_port:1883,mqtt_username:'',
+         mqtt_base_topic:'nintidetect/195',mqtt_device_name:'NintiDetect 195'};
 let drawing=null;
 let hover=null;
 let flashes=[];
@@ -397,6 +432,7 @@ function loadConf(){
       const fc=document.getElementById('fpsCap');
       const tfps=(c.target_fps==null)?15:c.target_fps;
       if(fc){fc.value=tfps; document.getElementById('fpsv').textContent=tfps==0?'off':tfps;}
+      loadMqttFields(c);
       renderDzList();
       renderZones(); renderClasses();
     }).catch(e=>setStatus('load config failed: '+e));
@@ -546,6 +582,67 @@ function updateMotionBtn(){
   if(!btn)return;
   btn.textContent=cfg.motion_enabled?'Enabled (click to disable)':'Disabled (click to enable)';
   btn.className=cfg.motion_enabled?'act':'red';
+}
+
+function loadMqttFields(c){
+  const set=(id,v)=>{const el=document.getElementById(id); if(el) el.value=(v==null?'':v);};
+  cfg.mqtt_enabled=!!c.mqtt_enabled;
+  set('mqttHost', c.mqtt_host||'');
+  set('mqttPort', c.mqtt_port||1883);
+  set('mqttUser', c.mqtt_username||'');
+  set('mqttPass', '');
+  set('mqttBase', c.mqtt_base_topic||'nintidetect/195');
+  set('mqttName', c.mqtt_device_name||'NintiDetect 195');
+  updateMqttBtn();
+  const st=document.getElementById('mqttStatus');
+  if(st) st.textContent=c.mqtt_has_password?'password saved':'';
+}
+function updateMqttBtn(){
+  const btn=document.getElementById('btnMqtt');
+  if(!btn)return;
+  btn.textContent=cfg.mqtt_enabled?'Enabled':'Disabled';
+  btn.className=cfg.mqtt_enabled?'act':'red';
+}
+function toggleMqtt(){
+  cfg.mqtt_enabled=!cfg.mqtt_enabled;
+  updateMqttBtn();
+}
+function mqttPayload(){
+  const p={
+    mqtt_enabled:!!cfg.mqtt_enabled,
+    mqtt_host:document.getElementById('mqttHost').value.trim(),
+    mqtt_port:parseInt(document.getElementById('mqttPort').value||'1883'),
+    mqtt_username:document.getElementById('mqttUser').value,
+    mqtt_base_topic:document.getElementById('mqttBase').value.trim()||'nintidetect/195',
+    mqtt_device_name:document.getElementById('mqttName').value.trim()||'NintiDetect 195',
+  };
+  const pw=document.getElementById('mqttPass').value;
+  if(pw) p.mqtt_password=pw;
+  return p;
+}
+function applyMqtt(){
+  const st=document.getElementById('mqttStatus');
+  if(st) st.textContent='saving...';
+  const p=mqttPayload();
+  return fetch('http://'+ip+':7778/api/config',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(p)
+  }).then(r=>r.json()).then(()=>{
+    Object.assign(cfg,p);
+    document.getElementById('mqttPass').value='';
+    updateMqttBtn();
+    if(st) st.textContent='saved';
+  }).catch(e=>{if(st) st.textContent='failed'; setStatus(''+e);});
+}
+function testMqtt(){
+  const st=document.getElementById('mqttStatus');
+  if(st) st.textContent='testing...';
+  applyMqtt().then(()=>{
+    fetch('http://'+ip+':7778/api/mqtt/test',{method:'POST'})
+      .then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{
+        if(st) st.textContent=ok?'published':'failed: '+(j.last_error||'unknown');
+      }).catch(e=>{if(st) st.textContent='failed'; setStatus(''+e);});
+  });
 }
 function applyThresh(){
   cfg.threshold=parseFloat(document.getElementById('th').value);

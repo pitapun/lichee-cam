@@ -54,6 +54,14 @@ DEFAULT_CONFIG = {
     # Frame-rate cap for stream_yolo main loop. Lower = less CPU = cooler SoC.
     # 0 means uncapped (sensor max ~30fps).
     'target_fps': 15,
+    'mqtt_enabled': False,
+    'mqtt_host': '',
+    'mqtt_port': 1883,
+    'mqtt_username': '',
+    'mqtt_password': '',
+    'mqtt_discovery_prefix': 'homeassistant',
+    'mqtt_base_topic': 'nintidetect/195',
+    'mqtt_device_name': 'NintiDetect 195',
 }
 INFER_SIZE = 640
 MAX_ZONES  = 4
@@ -122,9 +130,8 @@ def _ws_status_loop():
     while True:
         time.sleep(1.0)
         try:
-            # Drive track expiry even when captureRaw mode suppresses UDP detections.
-            # During events, stream_yolo sends only _fps/_status UDP which don't call
-            # _expire_tracks(), so we must do it here to enforce the extended timeout.
+            # Drive track expiry even when no detection UDP packets arrive.
+            # Event recording pauses inference, so the status loop owns timeout expiry.
             _expire_tracks()
             soc_temp = None
             try:
@@ -145,6 +152,7 @@ def _ws_status_loop():
             }
             status.update(_ws_state)
             _ws_broadcast(status)
+            mqtt_publish_status(status)
         except Exception:
             pass
 
@@ -170,6 +178,175 @@ def save_cfg():
             json.dump(cfg, f, indent=2)
     except Exception as e:
         print(f'[config] save error: {e}')
+
+def public_cfg():
+    with config_lock:
+        out = cfg.copy()
+    pw = out.pop('mqtt_password', '')
+    out['mqtt_has_password'] = bool(pw)
+    return out
+
+# ---- Minimal MQTT publisher (MQTT 3.1.1, QoS 0, stdlib only) ----
+mqtt_lock = threading.Lock()
+mqtt_state = {'last_error': '', 'last_pub': 0, 'discovery_sent': False}
+_mqtt_last_status = 0
+
+def _mqtt_enabled_cfg():
+    with config_lock:
+        return {
+            'enabled': bool(cfg.get('mqtt_enabled')),
+            'host': str(cfg.get('mqtt_host') or '').strip(),
+            'port': int(cfg.get('mqtt_port') or 1883),
+            'username': str(cfg.get('mqtt_username') or ''),
+            'password': str(cfg.get('mqtt_password') or ''),
+            'prefix': str(cfg.get('mqtt_discovery_prefix') or 'homeassistant').strip('/'),
+            'base': str(cfg.get('mqtt_base_topic') or 'nintidetect/195').strip('/'),
+            'name': str(cfg.get('mqtt_device_name') or 'NintiDetect 195'),
+        }
+
+def _mqtt_rl(n):
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            return bytes(out)
+
+def _mqtt_str(s):
+    b = str(s).encode('utf-8')
+    return len(b).to_bytes(2, 'big') + b
+
+def _mqtt_connect_packet(client_id, username, password):
+    flags = 0x02
+    payload = _mqtt_str(client_id)
+    if username:
+        flags |= 0x80
+        payload += _mqtt_str(username)
+    if password:
+        flags |= 0x40
+        payload += _mqtt_str(password)
+    vh = _mqtt_str('MQTT') + bytes([4, flags]) + (30).to_bytes(2, 'big')
+    body = vh + payload
+    return bytes([0x10]) + _mqtt_rl(len(body)) + body
+
+def _mqtt_publish_packet(topic, payload, retain=False):
+    if isinstance(payload, dict):
+        payload = json.dumps(payload, separators=(',', ':'))
+    body = _mqtt_str(topic) + str(payload).encode('utf-8')
+    return bytes([0x31 if retain else 0x30]) + _mqtt_rl(len(body)) + body
+
+def _mqtt_publish_many(messages):
+    mc = _mqtt_enabled_cfg()
+    if not mc['enabled'] or not mc['host']:
+        return False
+    with mqtt_lock:
+        try:
+            s = socket.create_connection((mc['host'], mc['port']), timeout=3)
+            try:
+                cid = 'nintidetect-' + socket.gethostname()
+                s.sendall(_mqtt_connect_packet(cid, mc['username'], mc['password']))
+                resp = s.recv(4)
+                if len(resp) < 4 or resp[0] != 0x20 or resp[3] != 0:
+                    raise RuntimeError(f'connect refused {resp!r}')
+                for topic, payload, retain in messages:
+                    s.sendall(_mqtt_publish_packet(topic, payload, retain))
+                mqtt_state['last_error'] = ''
+                mqtt_state['last_pub'] = time.time()
+                return True
+            finally:
+                try: s.close()
+                except Exception: pass
+        except Exception as e:
+            mqtt_state['last_error'] = str(e)
+            return False
+
+def _mqtt_device(mc):
+    return {
+        'identifiers': ['nintidetect_195'],
+        'name': mc['name'],
+        'manufacturer': 'Thylation',
+        'model': 'LicheeRV Nano NintiDetect',
+    }
+
+def _mqtt_discovery_messages():
+    mc = _mqtt_enabled_cfg()
+    base, prefix = mc['base'], mc['prefix']
+    dev = _mqtt_device(mc)
+    common = {'device': dev, 'availability_topic': f'{base}/availability'}
+    specs = [
+        ('sensor', 'temperature', {
+            'name': 'Temperature', 'state_topic': f'{base}/status',
+            'value_template': '{{ value_json.soc_temp }}',
+            'unit_of_measurement': '°C', 'device_class': 'temperature',
+        }),
+        ('sensor', 'fps', {
+            'name': 'FPS', 'state_topic': f'{base}/status',
+            'value_template': '{{ value_json.fps }}',
+            'unit_of_measurement': 'fps',
+        }),
+        ('sensor', 'tracks', {
+            'name': 'Tracks', 'state_topic': f'{base}/status',
+            'value_template': '{{ value_json.tracks }}',
+        }),
+        ('sensor', 'events', {
+            'name': 'Active Events', 'state_topic': f'{base}/status',
+            'value_template': '{{ value_json.events }}',
+        }),
+        ('sensor', 'last_event', {
+            'name': 'Last Event', 'state_topic': f'{base}/event',
+            'value_template': '{{ value_json.name }}',
+            'json_attributes_topic': f'{base}/event',
+        }),
+        ('binary_sensor', 'detector', {
+            'name': 'Detector', 'state_topic': f'{base}/status',
+            'value_template': "{{ 'ON' if value_json.yolo else 'OFF' }}",
+            'payload_on': 'ON', 'payload_off': 'OFF',
+        }),
+        ('binary_sensor', 'recording', {
+            'name': 'Recording', 'state_topic': f'{base}/status',
+            'value_template': "{{ 'ON' if value_json.events|int > 0 else 'OFF' }}",
+            'payload_on': 'ON', 'payload_off': 'OFF',
+        }),
+    ]
+    msgs = [(f'{base}/availability', 'online', True)]
+    for domain, key, payload in specs:
+        payload.update(common)
+        payload['unique_id'] = f'nintidetect_195_{key}'
+        payload['object_id'] = f'nintidetect_195_{key}'
+        msgs.append((f'{prefix}/{domain}/nintidetect_195/{key}/config', payload, True))
+    return msgs
+
+def mqtt_publish_discovery(force=False):
+    if not force and mqtt_state.get('discovery_sent'):
+        return
+    if _mqtt_publish_many(_mqtt_discovery_messages()):
+        mqtt_state['discovery_sent'] = True
+
+def mqtt_publish_status(status, force=False):
+    global _mqtt_last_status
+    mc = _mqtt_enabled_cfg()
+    if not mc['enabled'] or not mc['host']:
+        return
+    now = time.time()
+    if not force and now - _mqtt_last_status < 5:
+        return
+    _mqtt_last_status = now
+    mqtt_publish_discovery()
+    payload = status.copy()
+    payload['mode'] = cfg.get('mode', 'ninti')
+    payload['yolo'] = _yolo_running()
+    payload['rtsp'] = _rtsp_running()
+    _mqtt_publish_many([(f"{mc['base']}/status", payload, False)])
+
+def mqtt_publish_event(rec):
+    mc = _mqtt_enabled_cfg()
+    if not mc['enabled'] or not mc['host']:
+        return
+    mqtt_publish_discovery()
+    _mqtt_publish_many([(f"{mc['base']}/event", rec, False)])
 
 # ---- Point-in-polygon (ray casting) ----
 def pip(x, y, poly):
@@ -240,6 +417,7 @@ def _write_event(kind, tr, now):
             rec['record_fps'] = tr.get('record_fps')
         with open(EVENT_FILE, 'a') as f:
             f.write(json.dumps(rec, separators=(',', ':')) + '\n')
+        mqtt_publish_event(rec)
     except Exception as e:
         print(f'[events] write error: {e}')
 
@@ -2225,8 +2403,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self._cors()
             self.end_headers()
-            with config_lock:
-                self.wfile.write(json.dumps(cfg).encode())
+            self.wfile.write(json.dumps(public_cfg()).encode())
 
         elif path == '/api/status':
             self.send_response(200)
@@ -2412,9 +2589,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 new = json.loads(body)
                 restart = new.pop('_restart', False)
+                new.pop('mqtt_has_password', None)
+                if new.get('mqtt_password', None) == '':
+                    new.pop('mqtt_password', None)
                 with config_lock:
                     cfg.update(new)
                 save_cfg()
+                if any(k.startswith('mqtt_') for k in new):
+                    mqtt_state['discovery_sent'] = False
+                    mqtt_publish_discovery(force=True)
                 if restart:
                     start_yolo()
                 self.send_response(200)
@@ -2426,6 +2609,32 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 self.wfile.write(str(e).encode())
+
+        elif path == '/api/mqtt/test':
+            mqtt_state['discovery_sent'] = False
+            status = {
+                'ts': time.time(),
+                'type': 'status',
+                'soc_temp': None,
+                'tracks': len(tracks),
+                'events': len(event_recorders),
+            }
+            try:
+                with open('/sys/class/thermal/thermal_zone0/temp') as _t:
+                    status['soc_temp'] = round(int(_t.read().strip()) / 1000.0, 1)
+            except Exception:
+                pass
+            mqtt_publish_status(status, force=True)
+            ok = not mqtt_state.get('last_error')
+            self.send_response(200 if ok else 500)
+            self.send_header('Content-Type', 'application/json')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'ok': ok,
+                'last_error': mqtt_state.get('last_error', ''),
+                'last_pub': mqtt_state.get('last_pub', 0),
+            }).encode())
 
         elif path == '/api/reboot':
             self.send_response(200)
