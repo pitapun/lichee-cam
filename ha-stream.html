@@ -6,28 +6,51 @@
 <title>NintiDetect Stream</title>
 <style>
 html,body{margin:0;width:100%;height:100%;background:#000;overflow:hidden}
-#wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000}
-#stream{display:block;width:100%;height:100%;object-fit:contain;background:#000}
+video{display:block;width:100%;height:100%;object-fit:contain;background:#000}
 #status{position:fixed;left:8px;bottom:8px;color:#8cf;background:rgba(0,0,0,.65);font:11px monospace;padding:4px 6px}
 </style>
 </head>
 <body>
-<div id="wrap"><img id="stream" alt="stream"></div>
+<video id="player" muted autoplay playsinline></video>
 <div id="status">connecting</div>
+<script src="/hls.min.js"></script>
 <script>
-const img=document.getElementById('stream');
+const video=document.getElementById('player');
 const statusEl=document.getElementById('status');
+const src='/hls/live.m3u8';
+let hls=null;
 function status(s){statusEl.textContent=s;}
-function connect(){
-  status('live');
-  img.src='/stream?t='+Date.now();
+function play(){
+  if(hls){hls.destroy();hls=null;}
+  if(window.Hls&&Hls.isSupported()){
+    hls=new Hls({
+      liveSyncDurationCount:3,
+      liveMaxLatencyDurationCount:8,
+      maxBufferLength:30,
+      maxMaxBufferLength:30,
+      maxLiveSyncPlaybackRate:1.0,
+      lowLatencyMode:false
+    });
+    hls.loadSource(src);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().then(()=>status('live')).catch(()=>status('tap to play')));
+    hls.on(Hls.Events.ERROR,(ev,data)=>{
+      status(data&&data.details?data.details:'stream error');
+      if(data&&data.fatal&&data.type===Hls.ErrorTypes.MEDIA_ERROR){
+        hls.recoverMediaError();
+      }else if(data&&data.fatal){
+        setTimeout(play,2000);
+      }
+    });
+  }else if(video.canPlayType('application/vnd.apple.mpegurl')){
+    video.src=src;
+    video.play().then(()=>status('live')).catch(()=>status('tap to play'));
+  }else{
+    status('HLS unsupported');
+  }
 }
-img.addEventListener('error',()=>{
-  status('reconnecting');
-  setTimeout(connect,1500);
-});
-img.addEventListener('load',()=>status('live'));
-connect();
+video.addEventListener('click',()=>video.play().catch(()=>{}));
+play();
 </script>
 </body>
 </html>
