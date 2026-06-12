@@ -1068,6 +1068,13 @@ def _start_yolo_inner():
             except: yolo_proc.kill()
         env = os.environ.copy()
         env['LD_LIBRARY_PATH'] = LD_PATH
+        # Replace musl's mallocng (heavy per-thread mmap fragmentation under
+        # opencv + cvi-sdk churn -> ~110 KB/min VmData creep, OOM in hours)
+        # with jemalloc, which returns idle pages to the OS via madvise and
+        # coalesces thread arenas. Only injected into stream_yolo, not into
+        # sidecar python3 or ffmpeg, to keep the blast radius narrow.
+        if os.path.exists('/root/libs_patch/libjemalloc.so.2'):
+            env['LD_PRELOAD'] = '/root/libs_patch/libjemalloc.so.2'
         # GC4653 sensor floor is ~2.75fps; clamp at 3 even if user picks lower
         # (target_frame_us sleep in main.cpp still honours the user value).
         _tfps_env = int(cfg.get('target_fps', 0) or 0)
@@ -1183,10 +1190,21 @@ def _watchdog():
 def _rss_logger():
     """Sample stream_yolo VmRSS every 30s into /tmp/stream_yolo_rss.log
     along with the current event count, so we can correlate memory
-    growth with event-recording cycles across respawns."""
+    growth with event-recording cycles across respawns. Also triggers a
+    preemptive graceful restart when VmRSS exceeds a safety threshold:
+    jemalloc keeps idle leak near zero but event-time churn still creeps
+    ~75 KB/min HWM, so without this the process would eventually OOM
+    despite Phase 1 + jemalloc. Graceful restart releases CVI resources
+    cleanly (no VPSS/ION stuck state) and avoids the reboot path."""
     log_path = '/tmp/stream_yolo_rss.log'
     events_dir = '/root/ninti_events'
+    # Trigger restart at 35 MB RSS; OOM kicks in around 50-60 MB on this
+    # 128 MB device. Cool-off prevents restart loop if jemalloc has a one
+    # time-high water-mark that resists shrinking.
+    RSS_RESTART_KB = 35_000
+    RSS_RESTART_COOL_S = 30 * 60
     last_pid = None
+    last_restart_ts = 0
     while True:
         time.sleep(30)
         with yolo_lock:
@@ -1220,6 +1238,20 @@ def _rss_logger():
         except Exception:
             pass
         last_pid = pid
+        try:
+            rss_kb = int(stats.get('VmRSS', 0))
+        except Exception:
+            rss_kb = 0
+        if (rss_kb > RSS_RESTART_KB
+                and (time.time() - last_restart_ts) > RSS_RESTART_COOL_S):
+            print(f'[rss-restart] VmRSS={rss_kb}KB > {RSS_RESTART_KB}KB, '
+                  f'triggering graceful stream_yolo restart')
+            last_restart_ts = time.time()
+            def _do_restart():
+                stop_yolo()
+                time.sleep(1)
+                start_yolo()
+            threading.Thread(target=_do_restart, daemon=True).start()
 
 # ---- Motion detector (frame difference, independent of AI) ----
 MOTION_SENSITIVITY = 20   # pixel diff threshold per channel (0-255)
