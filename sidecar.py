@@ -1151,12 +1151,25 @@ def _proc_state(pid):
 def _watchdog():
     global _dstate_count
     import subprocess as _sp
+    _respawn_count = 0
     while True:
         time.sleep(10)
         with yolo_lock:
-            pid = yolo_proc.pid if yolo_proc else None
-        if pid is None:
+            proc = yolo_proc
+            pid = proc.pid if proc else None
+            exit_code = proc.poll() if proc else None
+        if proc is None:
             _dstate_count = 0
+            continue
+        if exit_code is not None:
+            # Process died (OOM, crash, abort). sidecar did not initiate
+            # the stop -- yolo_proc is still set -- so auto-respawn.
+            _respawn_count += 1
+            print(f'[watchdog] stream_yolo pid {pid} died (exit={exit_code}); '
+                  f'respawn #{_respawn_count}')
+            threading.Thread(target=_start_yolo_inner, daemon=True).start()
+            _dstate_count = 0
+            time.sleep(5)
             continue
         st = _proc_state(pid)
         if st == 'D':
@@ -1167,6 +1180,48 @@ def _watchdog():
                 _sp.call(['reboot', '-f'])
         else:
             _dstate_count = 0
+
+# ---- RSS logger (memory growth tracking) ----
+def _rss_logger():
+    """Sample stream_yolo VmRSS every 30s into /tmp/stream_yolo_rss.log
+    along with the current event count, so we can correlate memory
+    growth with event-recording cycles across respawns."""
+    log_path = '/tmp/stream_yolo_rss.log'
+    events_dir = '/root/ninti_events'
+    last_pid = None
+    while True:
+        time.sleep(30)
+        with yolo_lock:
+            proc = yolo_proc
+            pid = proc.pid if proc and proc.poll() is None else None
+        if pid is None:
+            continue
+        stats = {}
+        try:
+            with open(f'/proc/{pid}/status') as f:
+                for line in f:
+                    if line.startswith(('VmRSS:', 'VmSize:', 'VmData:', 'VmPeak:')):
+                        k, v = line.split(':', 1)
+                        stats[k.strip()] = v.strip().split()[0]
+        except Exception:
+            continue
+        try:
+            events = sum(1 for e in os.scandir(events_dir)
+                         if e.name.startswith('event_'))
+        except Exception:
+            events = -1
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            with open(log_path, 'a') as f:
+                if last_pid is not None and pid != last_pid:
+                    f.write(f'{ts} ---- pid changed {last_pid} -> {pid} (respawn) ----\n')
+                f.write(f'{ts} pid={pid} VmRSS={stats.get("VmRSS","?")}kB '
+                        f'VmSize={stats.get("VmSize","?")}kB '
+                        f'VmData={stats.get("VmData","?")}kB '
+                        f'events={events}\n')
+        except Exception:
+            pass
+        last_pid = pid
 
 # ---- Motion detector (frame difference, independent of AI) ----
 MOTION_SENSITIVITY = 20   # pixel diff threshold per channel (0-255)
@@ -2861,6 +2916,7 @@ if __name__ == '__main__':
 
     threading.Thread(target=udp_listener, daemon=True).start()
     threading.Thread(target=_watchdog, daemon=True).start()
+    threading.Thread(target=_rss_logger, daemon=True).start()
     threading.Thread(target=_motion_detector, daemon=True).start()
     threading.Thread(target=_storage_cleanup_loop, daemon=True).start()
     threading.Thread(target=_ws_status_loop, daemon=True).start()
