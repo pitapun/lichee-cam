@@ -458,19 +458,32 @@ public:
     void stop() {
         if (!active) return;
         for (int i = 0; i < 10; i++) drain(100);
-        CVI_VENC_StopRecvFrame(chn);
-        CVI_VENC_DestroyChn(chn);
-        chn_ready = false;
+        // Phase 1 leak mitigation: keep CHN1 alive across events. The
+        // CVITEK encoder driver leaks ~10KB per CreateChn/DestroyChn pair,
+        // so cycling channels per event burns ~20MB over ~600 events and
+        // OOMs stream_yolo. Leaving CHN1 in StartRecvFrame state is safe:
+        // send() is gated by `active`, so no frames flow between events;
+        // start() drains residual packs and issues a fresh IDR.
         if (fp) {
             fflush(fp);
             fclose(fp);
             fp = nullptr;
         }
-        fprintf(stderr, "[venc] stop frames=%d path=%s\n", frames, out_path.c_str());
+        fprintf(stderr, "[venc] stop frames=%d path=%s (chn kept)\n", frames, out_path.c_str());
         active = false;
     }
 
-    void destroy() { stop(); }
+    void destroy() {
+        // Full teardown for process exit: stop() only closes fp now (keeps
+        // CHN1 alive to avoid per-event leak), so do the actual VENC
+        // shutdown here.
+        stop();
+        if (chn_ready) {
+            CVI_VENC_StopRecvFrame(chn);
+            CVI_VENC_DestroyChn(chn);
+            chn_ready = false;
+        }
+    }
 
     bool is_active() const { return active; }
 

@@ -1151,7 +1151,6 @@ def _proc_state(pid):
 def _watchdog():
     global _dstate_count
     import subprocess as _sp
-    _respawn_count = 0
     while True:
         time.sleep(10)
         with yolo_lock:
@@ -1162,14 +1161,13 @@ def _watchdog():
             _dstate_count = 0
             continue
         if exit_code is not None:
-            # Process died (OOM, crash, abort). sidecar did not initiate
-            # the stop -- yolo_proc is still set -- so auto-respawn.
-            _respawn_count += 1
-            print(f'[watchdog] stream_yolo pid {pid} died (exit={exit_code}); '
-                  f'respawn #{_respawn_count}')
-            threading.Thread(target=_start_yolo_inner, daemon=True).start()
-            _dstate_count = 0
-            time.sleep(5)
+            # Process died (OOM, crash). VPSS group + ION buffers are
+            # leaked in kernel state and a respawn gets EBUSY on the
+            # sensor, so the only reliable recovery is reboot. (Verified
+            # 2026-06-12: post-OOM respawn -> CVI_VI_EnableChn c002800c.)
+            print(f'[watchdog] stream_yolo pid {pid} died (exit={exit_code}); rebooting')
+            _sp.call(['reboot', '-f'])
+            time.sleep(60)
             continue
         st = _proc_state(pid)
         if st == 'D':
