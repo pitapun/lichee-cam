@@ -1238,20 +1238,16 @@ def _rss_logger():
         except Exception:
             pass
         last_pid = pid
-        try:
-            rss_kb = int(stats.get('VmRSS', 0))
-        except Exception:
-            rss_kb = 0
-        if (rss_kb > RSS_RESTART_KB
-                and (time.time() - last_restart_ts) > RSS_RESTART_COOL_S):
-            print(f'[rss-restart] VmRSS={rss_kb}KB > {RSS_RESTART_KB}KB, '
-                  f'triggering graceful stream_yolo restart')
-            last_restart_ts = time.time()
-            def _do_restart():
-                stop_yolo()
-                time.sleep(1)
-                start_yolo()
-            threading.Thread(target=_do_restart, daemon=True).start()
+        # Soft-restart DISABLED 2026-06-13: stream_yolo's SIGTERM handler is
+        # `_exit(0)` (main.cpp:30), which skips C++ destructors -> VPSS group
+        # and ION buffers leak in kernel state, exactly the same failure mode
+        # as OOM kill. After a soft-restart the respawned stream_yolo cannot
+        # claim the sensor (CVI_VI_EnableChn c002800c) and HLS stays dead
+        # until reboot. Keep the threshold for future re-enable once main.cpp
+        # signal handling does proper destructor teardown.
+        _ = RSS_RESTART_KB
+        _ = RSS_RESTART_COOL_S
+        _ = last_restart_ts
 
 # ---- Motion detector (frame difference, independent of AI) ----
 MOTION_SENSITIVITY = 20   # pixel diff threshold per channel (0-255)
