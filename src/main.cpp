@@ -226,10 +226,14 @@ public:
     void stop() {
         if (!active) return;
         active = false;
+        venc_active = false;
         drain_cv_.notify_all();
-        if (drain_thr_.joinable()) drain_thr_.join();
         CVI_VENC_StopRecvFrame(chn);
         CVI_VENC_DestroyChn(chn);
+        if (drain_thr_.joinable()) {
+            drain_thr_.detach();
+            fprintf(stderr, "[hls] drain thread detached during shutdown\n");
+        }
         if (fd >= 0) { close(fd); fd = -1; }
         fprintf(stderr, "[hls] stopped\n");
     }
