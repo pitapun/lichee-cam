@@ -27,7 +27,6 @@
 
 volatile uint8_t interrupted = 0;
 void interrupt_handler(int signum) {
-    if (signum == SIGTERM) _exit(0);  // fast exit: kernel closes CVI fds, avoids D-state in driver cleanup
     interrupted = 1;
 }
 
@@ -74,6 +73,13 @@ static void udp_send(const char *s) {
 static long now_ms() {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static long shutdown_t0_ms = 0;
+static void shutdown_stage(const char* stage) {
+    long now = now_ms();
+    if (shutdown_t0_ms == 0) shutdown_t0_ms = now;
+    fprintf(stderr, "[shutdown] stage=%s t=%ldms\n", stage, now - shutdown_t0_ms);
 }
 
 struct HdRecordJob {
@@ -1177,24 +1183,42 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    shutdown_stage("main loop exited");
     printf("Stopping...\n");
+    shutdown_stage("before hlsrec.stop");
     hlsrec.stop();
+    shutdown_stage("after hlsrec.stop");
     if (hls_ion_vir) {
+        shutdown_stage("before hls ion free");
         CVI_SYS_IonFree(hls_ion_phy, hls_ion_vir);
         hls_ion_vir = nullptr;
+        shutdown_stage("after hls ion free");
     }
     if (!hd_record_dir.empty()) {
+        shutdown_stage("before write hd done");
         write_hd_done(hd_record_dir);
+        shutdown_stage("after write hd done");
     }
+    shutdown_stage("before h264rec.destroy");
     h264rec.destroy();
+    shutdown_stage("after h264rec.destroy");
+    shutdown_stage("before hd writer stop");
     {
         std::lock_guard<std::mutex> lock(hd_queue_mutex);
         hd_writer_stop = true;
     }
     hd_queue_cv.notify_one();
+    shutdown_stage("before hd writer join");
     if (hd_writer.joinable()) hd_writer.join();
+    shutdown_stage("after hd writer join");
+    shutdown_stage("before cap.release");
     cap.release();
+    shutdown_stage("after cap.release");
+    shutdown_stage("before detector.release");
     detector.release();
+    shutdown_stage("after detector.release");
+    shutdown_stage("before udp close");
     if (udp_fd >= 0) close(udp_fd);
+    shutdown_stage("after udp close");
     return 0;
 }

@@ -1124,7 +1124,9 @@ def _start_yolo_inner():
               f'zones={clamped} active={cfg.get("active_detector",False)} '
               f'fps_cap={tfps or "off"}')
         _stop_hls_ffmpeg()
-        yolo_log = open('/tmp/stream_yolo.log', 'w')
+        yolo_log = open('/tmp/stream_yolo.log', 'a')
+        yolo_log.write(f'\n[yolo] exec start ts={time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+        yolo_log.flush()
         yolo_proc = subprocess.Popen(args, env=env, stdout=yolo_log, stderr=yolo_log)
         if HLS_ENABLED:
             threading.Thread(target=_start_hls_ffmpeg, daemon=True).start()
@@ -1198,10 +1200,10 @@ def _rss_logger():
     cleanly (no VPSS/ION stuck state) and avoids the reboot path."""
     log_path = '/tmp/stream_yolo_rss.log'
     events_dir = '/root/ninti_events'
-    # Trigger restart at 35 MB RSS; OOM kicks in around 50-60 MB on this
+    # Trigger restart at 30 MB RSS; OOM kicks in around 50-60 MB on this
     # 128 MB device. Cool-off prevents restart loop if jemalloc has a one
     # time-high water-mark that resists shrinking.
-    RSS_RESTART_KB = 35_000
+    RSS_RESTART_KB = 30_000
     RSS_RESTART_COOL_S = 30 * 60
     last_pid = None
     last_restart_ts = 0
@@ -1238,16 +1240,21 @@ def _rss_logger():
         except Exception:
             pass
         last_pid = pid
-        # Soft-restart DISABLED 2026-06-13: stream_yolo's SIGTERM handler is
-        # `_exit(0)` (main.cpp:30), which skips C++ destructors -> VPSS group
-        # and ION buffers leak in kernel state, exactly the same failure mode
-        # as OOM kill. After a soft-restart the respawned stream_yolo cannot
-        # claim the sensor (CVI_VI_EnableChn c002800c) and HLS stays dead
-        # until reboot. Keep the threshold for future re-enable once main.cpp
-        # signal handling does proper destructor teardown.
-        _ = RSS_RESTART_KB
-        _ = RSS_RESTART_COOL_S
-        _ = last_restart_ts
+        try:
+            rss_kb = int(stats.get('VmRSS', '0'))
+        except Exception:
+            rss_kb = 0
+        now_ts = time.time()
+        if rss_kb > RSS_RESTART_KB and now_ts - last_restart_ts > RSS_RESTART_COOL_S:
+            last_restart_ts = now_ts
+            try:
+                with open(log_path, 'a') as f:
+                    f.write(f'{ts} ---- soft restart: VmRSS={rss_kb}kB threshold={RSS_RESTART_KB}kB ----\n')
+            except Exception:
+                pass
+            print(f'[rss] VmRSS={rss_kb}kB > {RSS_RESTART_KB}kB, soft restarting stream_yolo')
+            stop_yolo()
+            start_yolo()
 
 # ---- Motion detector (frame difference, independent of AI) ----
 MOTION_SENSITIVITY = 20   # pixel diff threshold per channel (0-255)
