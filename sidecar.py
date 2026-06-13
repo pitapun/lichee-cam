@@ -1075,6 +1075,7 @@ def _start_yolo_inner():
         # sidecar python3 or ffmpeg, to keep the blast radius narrow.
         if os.path.exists('/root/libs_patch/libjemalloc.so.2'):
             env['LD_PRELOAD'] = '/root/libs_patch/libjemalloc.so.2'
+            env['MALLOC_CONF'] = 'retain:false,dirty_decay_ms:0,muzzy_decay_ms:0'
         # GC4653 sensor floor is ~2.75fps; clamp at 3 even if user picks lower
         # (target_frame_us sleep in main.cpp still honours the user value).
         _tfps_env = int(cfg.get('target_fps', 0) or 0)
@@ -1201,9 +1202,13 @@ def _rss_logger():
     log_path = '/tmp/stream_yolo_rss.log'
     events_dir = '/root/ninti_events'
     # Trigger restart at 30 MB RSS; OOM kicks in around 50-60 MB on this
-    # 128 MB device. Cool-off prevents restart loop if jemalloc has a one
-    # time-high water-mark that resists shrinking.
+    # 128 MB device. Also restart if VmData crosses 45 MB: the remaining
+    # growth is mostly virtual mappings, but bounding it avoids finding out
+    # later that a retained extent can become resident under pressure.
+    # Cool-off prevents restart loops if jemalloc has a one-time high-water
+    # mark that resists shrinking.
     RSS_RESTART_KB = 30_000
+    DATA_RESTART_KB = 45_000
     RSS_RESTART_COOL_S = 30 * 60
     last_pid = None
     last_restart_ts = 0
@@ -1244,15 +1249,24 @@ def _rss_logger():
             rss_kb = int(stats.get('VmRSS', '0'))
         except Exception:
             rss_kb = 0
+        try:
+            data_kb = int(stats.get('VmData', '0'))
+        except Exception:
+            data_kb = 0
         now_ts = time.time()
-        if rss_kb > RSS_RESTART_KB and now_ts - last_restart_ts > RSS_RESTART_COOL_S:
+        restart_reason = None
+        if rss_kb > RSS_RESTART_KB:
+            restart_reason = f'VmRSS={rss_kb}kB threshold={RSS_RESTART_KB}kB'
+        elif data_kb > DATA_RESTART_KB:
+            restart_reason = f'VmData={data_kb}kB threshold={DATA_RESTART_KB}kB'
+        if restart_reason and now_ts - last_restart_ts > RSS_RESTART_COOL_S:
             last_restart_ts = now_ts
             try:
                 with open(log_path, 'a') as f:
-                    f.write(f'{ts} ---- soft restart: VmRSS={rss_kb}kB threshold={RSS_RESTART_KB}kB ----\n')
+                    f.write(f'{ts} ---- soft restart: {restart_reason} ----\n')
             except Exception:
                 pass
-            print(f'[rss] VmRSS={rss_kb}kB > {RSS_RESTART_KB}kB, soft restarting stream_yolo')
+            print(f'[rss] {restart_reason}, soft restarting stream_yolo')
             stop_yolo()
             start_yolo()
 
