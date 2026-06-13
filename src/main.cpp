@@ -157,7 +157,8 @@ static void hd_enqueue_done(const std::string &dir) {
 // race that plagued the old drain_loop thread.
 class HlsStreamer {
 public:
-    HlsStreamer() : active(false), chn(0), fd(-1), stream_started(false),
+    HlsStreamer() : active(false), chn(0), fd(-1), event_fp_(nullptr), event_bytes_(0),
+                    stream_started(false),
                     idr_pending(false), venc_active(false),
                     saved_w(0), saved_h(0), saved_fps(0), drain_requested_(false) {}
 
@@ -230,6 +231,7 @@ public:
 
     void stop() {
         if (!active) return;
+        stop_event_record();
         active = false;
         venc_active = false;
         drain_cv_.notify_all();
@@ -250,7 +252,107 @@ public:
     int get_w() const { return saved_w; }
     int get_h() const { return saved_h; }
 
+    bool start_event_record(const std::string& path, long preroll_ms = 2500) {
+        std::vector<uint8_t> preroll = snapshot_preroll(preroll_ms);
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "[hlsrec] fopen failed %s\n", path.c_str());
+            return false;
+        }
+        size_t wrote = 0;
+        if (!preroll.empty()) {
+            wrote = fwrite(preroll.data(), 1, preroll.size(), f);
+        }
+        {
+            std::lock_guard<std::mutex> lk(event_mtx_);
+            if (event_fp_) {
+                fflush(event_fp_);
+                fclose(event_fp_);
+            }
+            event_fp_ = f;
+            event_path_ = path;
+            event_bytes_ = wrote;
+        }
+        fprintf(stderr, "[hlsrec] event start %s preroll=%zu wrote=%zu\n",
+                path.c_str(), preroll.size(), wrote);
+        return true;
+    }
+
+    void stop_event_record() {
+        std::lock_guard<std::mutex> lk(event_mtx_);
+        if (!event_fp_) return;
+        fflush(event_fp_);
+        fclose(event_fp_);
+        fprintf(stderr, "[hlsrec] event stop bytes=%zu path=%s\n",
+                event_bytes_, event_path_.c_str());
+        event_fp_ = nullptr;
+        event_path_.clear();
+        event_bytes_ = 0;
+    }
+
+    std::vector<uint8_t> snapshot_preroll(long window_ms = 2500) {
+        std::lock_guard<std::mutex> lk(preroll_mtx_);
+        std::vector<uint8_t> out;
+        if (preroll_.empty()) return out;
+        long cutoff = now_ms() - window_ms;
+        size_t start = preroll_.size();
+        for (size_t i = 0; i < preroll_.size(); i++) {
+            if (preroll_[i].key_start && preroll_[i].ts_ms >= cutoff) {
+                start = i;
+                break;
+            }
+        }
+        if (start == preroll_.size()) {
+            for (size_t i = preroll_.size(); i > 0; i--) {
+                if (preroll_[i - 1].key_start) {
+                    start = i - 1;
+                    break;
+                }
+            }
+        }
+        if (start == preroll_.size()) start = 0;
+        size_t total = 0;
+        for (size_t i = start; i < preroll_.size(); i++) total += preroll_[i].data.size();
+        out.reserve(total);
+        for (size_t i = start; i < preroll_.size(); i++) {
+            out.insert(out.end(), preroll_[i].data.begin(), preroll_[i].data.end());
+        }
+        return out;
+    }
+
 private:
+    struct PrerollChunk {
+        long ts_ms;
+        bool key_start;
+        std::vector<uint8_t> data;
+    };
+
+    void remember_preroll(std::vector<uint8_t>&& bytes, bool key_start) {
+        if (bytes.empty()) return;
+        long ts = now_ms();
+        std::lock_guard<std::mutex> lk(preroll_mtx_);
+        preroll_.push_back({ts, key_start, std::move(bytes)});
+        const long keep_ms = 5000;
+        long cutoff = ts - keep_ms;
+        while (preroll_.size() > 1 && preroll_.front().ts_ms < cutoff) {
+            preroll_.pop_front();
+        }
+    }
+
+    void remember_preroll(const uint8_t* d, ssize_t sz, bool key_start) {
+        if (!d || sz <= 0) return;
+        std::vector<uint8_t> bytes(d, d + sz);
+        remember_preroll(std::move(bytes), key_start);
+    }
+
+    void write_event_bytes(const uint8_t* d, size_t sz) {
+        if (!d || sz == 0) return;
+        std::lock_guard<std::mutex> lk(event_mtx_);
+        if (!event_fp_) return;
+        size_t wrote = fwrite(d, 1, sz, event_fp_);
+        event_bytes_ += wrote;
+    }
+
     bool create_and_start_venc() {
         VENC_CHN_ATTR_S attr;
         memset(&attr, 0, sizeof(attr));
@@ -338,10 +440,21 @@ private:
                         stream_started = true;
                         fprintf(stderr, "[hls] first IDR — stream started\n");
                     }
+                    std::vector<uint8_t> au;
+                    au.reserve(sps_nalu.size() + pps_nalu.size() + (size_t)sz);
+                    au.insert(au.end(), sps_nalu.begin(), sps_nalu.end());
+                    au.insert(au.end(), pps_nalu.begin(), pps_nalu.end());
+                    au.insert(au.end(), d, d + sz);
+                    remember_preroll(std::move(au), true);
+                    write_event_bytes(sps_nalu.data(), sps_nalu.size());
+                    write_event_bytes(pps_nalu.data(), pps_nalu.size());
+                    write_event_bytes(d, (size_t)sz);
                     fifo_write(sps_nalu.data(), sps_nalu.size());
                     fifo_write(pps_nalu.data(), pps_nalu.size());
                     fifo_write(d, sz);
                 } else if (stream_started) {
+                    remember_preroll(d, sz, false);
+                    write_event_bytes(d, (size_t)sz);
                     fifo_write(d, sz);
                 }
             }
@@ -376,10 +489,16 @@ private:
     bool active, stream_started;
     VENC_CHN chn;
     int fd;
+    FILE* event_fp_;
+    std::mutex event_mtx_;
+    std::string event_path_;
+    size_t event_bytes_;
     std::atomic<bool> idr_pending;
     std::atomic<bool> venc_active;
     std::vector<uint8_t> sps_nalu, pps_nalu;
     std::vector<VENC_PACK_S> pack_buf_;
+    std::deque<PrerollChunk> preroll_;
+    std::mutex preroll_mtx_;
     int saved_w, saved_h, saved_fps;
     std::thread drain_thr_;
     std::mutex drain_mtx_;
@@ -974,27 +1093,19 @@ int main(int argc, char *argv[]) {
         std::string requested_hd_dir = read_hd_record_dir();
         if (requested_hd_dir != hd_record_dir) {
             if (!hd_record_dir.empty()) {
-                hlsrec.pause_venc();
-                h264rec.stop();
-                hlsrec.resume_venc();
+                hlsrec.stop_event_record();
                 write_hd_done(hd_record_dir);
             }
             hd_record_dir = requested_hd_dir;
             hd_record_idx = 0;
             last_hd_record_ms = ts - HD_RECORD_INTERVAL_MS;
             if (!hd_record_dir.empty() && original_frame) {
-                VIDEO_FRAME_S& vf = original_frame->stVFrame;
                 std::string h264_path = dirname_of(hd_record_dir) + "/event.h264";
-                h264rec.start(h264_path, (int)vf.u32Width, (int)vf.u32Height, target_fps > 0 ? target_fps : 25);
+                hlsrec.start_event_record(h264_path, 2500);
                 fprintf(stderr, "[hdrec] start dir=%s h264=%s\n", hd_record_dir.c_str(), h264_path.c_str());
             }
         }
         bool hd_recording = !hd_record_dir.empty();
-        if (hd_recording && original_frame) {
-            long hdr_t0 = now_ms();
-            h264rec.send(original_frame);
-            fprintf(stderr, "[diag] h264rec.send %ldms\n", now_ms()-hdr_t0);
-        }
         if (ENABLE_HLS && hlsrec.is_active() && !disp.empty()) {
             // IDR requests are now issued by the drain thread after each drain —
             // calling RequestIDR from the main thread blocks while drain polls VENC.
@@ -1231,6 +1342,9 @@ int main(int argc, char *argv[]) {
         shutdown_stage("after hls ion free");
     }
     if (!hd_record_dir.empty()) {
+        shutdown_stage("before hls event stop");
+        hlsrec.stop_event_record();
+        shutdown_stage("after hls event stop");
         shutdown_stage("before write hd done");
         write_hd_done(hd_record_dir);
         shutdown_stage("after write hd done");
