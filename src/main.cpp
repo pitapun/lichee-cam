@@ -160,6 +160,8 @@ public:
         // cap HLS at 1280x720 — CHN0 is live-view only; high-res uses CHN1
         if (w > 1280 || h > 720) { w = 1280; h = 720; }
         saved_w = w; saved_h = h; saved_fps = fps;
+        sps_nalu.reserve(256);
+        pps_nalu.reserve(256);
 
         static const char* FIFO = "/tmp/hls_feed.h264";
         while (fd < 0) {
@@ -307,8 +309,9 @@ private:
         VENC_STREAM_S stream;
         memset(&stream, 0, sizeof(stream));
         stream.u32PackCount = status.u32CurPacks;
-        stream.pstPack = (VENC_PACK_S*)calloc(status.u32CurPacks, sizeof(VENC_PACK_S));
-        if (!stream.pstPack) return;
+        pack_buf_.resize(status.u32CurPacks);
+        memset(pack_buf_.data(), 0, pack_buf_.size() * sizeof(VENC_PACK_S));
+        stream.pstPack = pack_buf_.data();
 
         if (CVI_VENC_GetStream(chn, &stream, timeout_ms) == CVI_SUCCESS) {
             for (CVI_U32 i = 0; i < stream.u32PackCount; i++) {
@@ -335,7 +338,6 @@ private:
             }
             CVI_VENC_ReleaseStream(chn, &stream);
         }
-        free(stream.pstPack);
     }
 
     void drain_thread_fn() {
@@ -368,6 +370,7 @@ private:
     std::atomic<bool> idr_pending;
     std::atomic<bool> venc_active;
     std::vector<uint8_t> sps_nalu, pps_nalu;
+    std::vector<VENC_PACK_S> pack_buf_;
     int saved_w, saved_h, saved_fps;
     std::thread drain_thr_;
     std::mutex drain_mtx_;
@@ -718,6 +721,16 @@ int main(int argc, char *argv[]) {
     int active_zone = 0;
     cv::Mat tile_sq;  // pre-allocated, reused each frame
     cv::Mat last_disp; // last regular-path frame, used to keep HLS alive during captureRaw
+    cv::Mat disp;
+    cv::Mat hls_frame;
+    cv::Mat hls_raw;
+    cv::Mat small;
+    cv::Mat diff;
+    cv::Mat gray;
+    cv::Mat mask;
+    cv::Mat disp_out;
+    std::vector<TileDet> all_dets;
+    std::vector<bool> suppressed;
 
     // Inference frame skip: run NPU every INFER_EVERY frames, show cached boxes in between
     const int INFER_EVERY = 2;
@@ -896,10 +909,11 @@ int main(int argc, char *argv[]) {
             if (ENABLE_HLS && hlsrec.is_active() && !last_disp.empty()
                     && (hls_now - hls_raw_last_ms) >= hls_interval_ms) {
                 hls_raw_last_ms = hls_now;
-                cv::Mat hls_raw = last_disp;
                 if (last_disp.cols != hlsrec.get_w() || last_disp.rows != hlsrec.get_h())
                     cv::resize(last_disp, hls_raw, cv::Size(hlsrec.get_w(), hlsrec.get_h()),
                                0, 0, cv::INTER_LINEAR);
+                else
+                    hls_raw = last_disp;
                 VIDEO_FRAME_INFO_S* nv21 = prepare_hls_frame(hls_raw);
                 if (nv21) hlsrec.send(nv21);
             }
@@ -932,7 +946,8 @@ int main(int argc, char *argv[]) {
         long t1 = now_ms(); acc_cap += t1 - t0;
 
         // Deep-copy out of DMA buffer immediately; all downstream ops use cached heap memory.
-        cv::Mat disp = frame.clone();
+        disp.create(frame.rows, frame.cols, frame.type());
+        frame.copyTo(disp);
         last_disp = disp;
         long t1a = now_ms();  // after clone
 
@@ -966,10 +981,11 @@ int main(int argc, char *argv[]) {
             // calling RequestIDR from the main thread blocks while drain polls VENC.
             // Downscale to HLS resolution (capped at 1280x720 in HlsStreamer::start)
             long pr_t0 = now_ms();
-            cv::Mat hls_frame = disp;
             if (disp.cols != hlsrec.get_w() || disp.rows != hlsrec.get_h())
                 cv::resize(disp, hls_frame, cv::Size(hlsrec.get_w(), hlsrec.get_h()),
                            0, 0, cv::INTER_LINEAR);
+            else
+                hls_frame = disp;
             VIDEO_FRAME_INFO_S* nv21 = prepare_hls_frame(hls_frame);
             static int pr_cnt = 0;
             if (++pr_cnt <= 5 || pr_cnt % 100 == 0)
@@ -985,11 +1001,9 @@ int main(int argc, char *argv[]) {
         cap.releaseImagePtr();
 
         // Motion detection on raw frame (before box drawing) at 1/4 res
-        cv::Mat small;
         cv::resize(disp, small, cv::Size(disp.cols/4, disp.rows/4), 0, 0, cv::INTER_NEAREST);
         bool motion = prev_small.empty();
         if (!motion) {
-            cv::Mat diff;
             cv::absdiff(small, prev_small, diff);
             cv::Scalar m = cv::mean(diff);
             motion = (m[0] + m[1] + m[2]) / 3.0f > motion_thresh;
@@ -997,7 +1011,6 @@ int main(int argc, char *argv[]) {
             // binary mask, take its first-order moments; require enough mass
             // before reporting a centroid (filters out noise).
             if (motion && active_follower) {
-                cv::Mat gray, mask;
                 cv::cvtColor(diff, gray, cv::COLOR_BGR2GRAY);
                 cv::threshold(gray, mask, 20, 255, cv::THRESH_BINARY);
                 cv::Moments mom = cv::moments(mask, true);
@@ -1077,12 +1090,12 @@ int main(int argc, char *argv[]) {
         long t3 = now_ms(); acc_infer += t3 - t2;
 
         // Merge all zone caches
-        std::vector<TileDet> all_dets;
+        all_dets.clear();
         for (size_t i = 0; i < zone_cache.size(); i++)
             all_dets.insert(all_dets.end(), zone_cache[i].begin(), zone_cache[i].end());
 
         // Cross-tile NMS: suppress lower-score duplicate that overlaps >40% IoU
-        std::vector<bool> suppressed(all_dets.size(), false);
+        suppressed.assign(all_dets.size(), false);
         for (size_t i = 0; i < all_dets.size(); i++) {
             if (suppressed[i]) continue;
             for (size_t j = i + 1; j < all_dets.size(); j++) {
@@ -1135,11 +1148,12 @@ int main(int argc, char *argv[]) {
         // MJPEG is secondary. While HD event recording is active, give disk
         // capture priority and let browser preview pause instead of slowing it.
         if (hd_record_dir.empty() && mjpeg.clientCount() > 0 && ts - last_mjpeg_ms >= MJPEG_FORCE_MS) {
-            cv::Mat disp_out = disp;
             if (disp.cols != 640 || disp.rows != 360) {
                 cv::resize(disp, disp_out, cv::Size(640, 360));
+                mjpeg.write(disp_out);
+            } else {
+                mjpeg.write(disp);
             }
-            mjpeg.write(disp_out);
             last_mjpeg_ms = ts;
         }
         long t5 = now_ms(); acc_mjpeg += t5 - t4;
