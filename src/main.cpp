@@ -1320,7 +1320,7 @@ int main(int argc, char *argv[]) {
         }
 
         // FPS cap: sleep remainder of target frame budget
-        if (target_frame_us > 0 && !hd_recording) {
+        if (target_frame_us > 0) {
             struct timespec end_ts;
             clock_gettime(CLOCK_MONOTONIC, &end_ts);
             long used_us = (end_ts.tv_sec - frame_start_ts.tv_sec) * 1000000L
