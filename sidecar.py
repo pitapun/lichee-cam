@@ -659,9 +659,7 @@ def _stream_interest():
         return True
     if _has_event_recorders() and not os.path.exists(HD_RECORD_CONTROL_FILE):
         return True
-    # Always maintain MJPEG connection while yolo_proc runs so pre-buffer stays filled
-    with yolo_lock:
-        return yolo_proc is not None
+    return False
 
 def _disk_used_pct(path):
     os.makedirs(path, exist_ok=True)
