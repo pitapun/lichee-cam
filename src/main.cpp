@@ -75,6 +75,11 @@ static long now_ms() {
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
+static bool env_on(const char* name) {
+    const char* v = getenv(name);
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
 static long shutdown_t0_ms = 0;
 static void shutdown_stage(const char* stage) {
     long now = now_ms();
@@ -677,6 +682,15 @@ int main(int argc, char *argv[]) {
     }
     fprintf(stderr, "[motion] thresh=%.2f\n", motion_thresh);
 
+    const bool ENABLE_HLS = !env_on("YOLO_DISABLE_HLS");
+    const bool ENABLE_MJPEG = !env_on("YOLO_DISABLE_MJPEG");
+    const bool ENABLE_NPU = !env_on("YOLO_DISABLE_NPU");
+    const bool ENABLE_MOTION = !env_on("YOLO_DISABLE_MOTION");
+    const bool FORCE_NPU = env_on("YOLO_FORCE_NPU");
+    fprintf(stderr, "[isolation] hls=%d mjpeg=%d npu=%d motion=%d force_npu=%d\n",
+            (int)ENABLE_HLS, (int)ENABLE_MJPEG, (int)ENABLE_NPU,
+            (int)ENABLE_MOTION, (int)FORCE_NPU);
+
     cv::setNumThreads(1);  // single-core SoC: parallel_for_ overhead > benefit
     udp_init("127.0.0.1", udp_port);
 
@@ -703,13 +717,15 @@ int main(int argc, char *argv[]) {
     YoloModelDetector detector;
     cv::Mat bgr;
     cap >> bgr;
-    cv::Mat bgr_mjpeg;
-    cv::resize(bgr, bgr_mjpeg, cv::Size(640, 360));
-    mjpeg.write(bgr_mjpeg);
-    mjpeg.start();
+    if (ENABLE_MJPEG) {
+        cv::Mat bgr_mjpeg;
+        cv::resize(bgr, bgr_mjpeg, cv::Size(640, 360));
+        mjpeg.write(bgr_mjpeg);
+        mjpeg.start();
+    }
     std::thread hd_writer(hd_writer_loop);
 
-    if (detector.setup_model(argv[1], atoi(argv[2]), thresh, 0.5f) != 1) {
+    if (ENABLE_NPU && detector.setup_model(argv[1], atoi(argv[2]), thresh, 0.5f) != 1) {
         printf("setup_model failed\n");
         return -2;
     }
@@ -743,7 +759,6 @@ int main(int argc, char *argv[]) {
     // Browser MJPEG preview is only for aiming/config. Keep it low-res and
     // throttled so JPEG encoding does not heat the SoC.
     cv::Mat prev_small;
-    const bool ENABLE_HLS = true;
     // HLS must advertise a frame rate close to the frame cadence we can
     // actually sustain. If this is higher than the real send rate, players
     // fast-forward during playback because the H264 stream timestamps imply
@@ -1005,26 +1020,29 @@ int main(int argc, char *argv[]) {
         cap.releaseImagePtr();
 
         // Motion detection on raw frame (before box drawing) at 1/4 res
-        cv::resize(disp, small, cv::Size(disp.cols/4, disp.rows/4), 0, 0, cv::INTER_NEAREST);
-        bool motion = prev_small.empty();
-        if (!motion) {
-            cv::absdiff(small, prev_small, diff);
-            cv::Scalar m = cv::mean(diff);
-            motion = (m[0] + m[1] + m[2]) / 3.0f > motion_thresh;
-            // Centroid of moving pixels for active follower. Threshold diff to a
-            // binary mask, take its first-order moments; require enough mass
-            // before reporting a centroid (filters out noise).
-            if (motion && active_follower) {
-                cv::cvtColor(diff, gray, cv::COLOR_BGR2GRAY);
-                cv::threshold(gray, mask, 20, 255, cv::THRESH_BINARY);
-                cv::Moments mom = cv::moments(mask, true);
-                if (mom.m00 > 200.0) {
-                    motion_cx = (int)(mom.m10 / mom.m00) * 4;  // scale 1/4 → disp
-                    motion_cy = (int)(mom.m01 / mom.m00) * 4;
+        bool motion = false;
+        if (ENABLE_MOTION) {
+            cv::resize(disp, small, cv::Size(disp.cols/4, disp.rows/4), 0, 0, cv::INTER_NEAREST);
+            motion = prev_small.empty();
+            if (!motion) {
+                cv::absdiff(small, prev_small, diff);
+                cv::Scalar m = cv::mean(diff);
+                motion = (m[0] + m[1] + m[2]) / 3.0f > motion_thresh;
+                // Centroid of moving pixels for active follower. Threshold diff to a
+                // binary mask, take its first-order moments; require enough mass
+                // before reporting a centroid (filters out noise).
+                if (motion && active_follower) {
+                    cv::cvtColor(diff, gray, cv::COLOR_BGR2GRAY);
+                    cv::threshold(gray, mask, 20, 255, cv::THRESH_BINARY);
+                    cv::Moments mom = cv::moments(mask, true);
+                    if (mom.m00 > 200.0) {
+                        motion_cx = (int)(mom.m10 / mom.m00) * 4;  // scale 1/4 -> disp
+                        motion_cy = (int)(mom.m01 / mom.m00) * 4;
+                    }
                 }
             }
+            small.copyTo(prev_small);
         }
-        small.copyTo(prev_small);
         if (motion) last_motion_ms = ts;
         // Active follower: slide zone 0 toward previous frame's motion centroid.
         // 50% step per frame (snappy on low fps; still smooth on high fps).
@@ -1040,7 +1058,7 @@ int main(int argc, char *argv[]) {
             if (z0.x > disp_w - z0.size) z0.x = disp_w - z0.size;
             if (z0.y > disp_h - z0.size) z0.y = disp_h - z0.size;
         }
-        bool npu_active = (ts - last_motion_ms) < NPU_HANGOVER_MS;
+        bool npu_active = FORCE_NPU || ((ts - last_motion_ms) < NPU_HANGOVER_MS);
         long t2 = now_ms(); acc_motion += t2 - t1;
 
         // Clear stale boxes once we go idle so UDP stops emitting old detections
@@ -1049,7 +1067,7 @@ int main(int argc, char *argv[]) {
         }
 
         // Inference frame skip: only run NPU every INFER_EVERY frames, and only when motion active
-        if (!hd_recording && npu_active && frame_count % INFER_EVERY == 0) {
+        if (ENABLE_NPU && !hd_recording && npu_active && frame_count % INFER_EVERY == 0) {
             int z = active_zone;
             const Zone &zone = zones[z];
             // Padded crop: zone may extend beyond frame — out-of-bounds area filled black.
@@ -1151,7 +1169,7 @@ int main(int argc, char *argv[]) {
 
         // MJPEG is secondary. While HD event recording is active, give disk
         // capture priority and let browser preview pause instead of slowing it.
-        if (hd_record_dir.empty() && mjpeg.clientCount() > 0 && ts - last_mjpeg_ms >= MJPEG_FORCE_MS) {
+        if (ENABLE_MJPEG && hd_record_dir.empty() && mjpeg.clientCount() > 0 && ts - last_mjpeg_ms >= MJPEG_FORCE_MS) {
             if (disp.cols != 640 || disp.rows != 360) {
                 cv::resize(disp, disp_out, cv::Size(640, 360));
                 mjpeg.write(disp_out);
