@@ -163,6 +163,9 @@ TRACK_CONFIRM_HITS = 2
 TRACK_LOST_TIMEOUT = 5.0    # object not detected for 5s -> gone
 TRACK_STILL_TIMEOUT = 5.0   # object not moving for 5s -> gone
 TRACK_MOVE_THRESHOLD = 0.04 # min center shift (normalised) to count as movement
+STATIONARY_SUPPRESS_ABSENT_TIMEOUT = 60.0
+STATIONARY_SUPPRESS_CENTER_THRESHOLD = 0.20
+STATIONARY_SUPPRESS_IOU_THRESHOLD = 0.05
 MIN_RECORD_SECS = 3.0       # minimum recording duration after confirmation
 
 cfg = DEFAULT_CONFIG.copy()
@@ -517,6 +520,52 @@ def _iou(a, b):
 def _center_dist(a, b):
     return ((float(a.get('cx', 0.5)) - float(b.get('cx', 0.5))) ** 2 +
             (float(a.get('cy', 0.5)) - float(b.get('cy', 0.5))) ** 2) ** 0.5
+
+stationary_suppressions = []
+
+def _prune_stationary_suppressions(now):
+    global stationary_suppressions
+    stationary_suppressions = [
+        s for s in stationary_suppressions
+        if now - s.get('last_seen', now) <= STATIONARY_SUPPRESS_ABSENT_TIMEOUT
+    ]
+
+def _stationary_match(det, sup):
+    same_cat = sup.get('cat') and sup.get('cat') == det.get('cat')
+    same_cls = sup.get('cls') is not None and sup.get('cls') == det.get('cls')
+    if not (same_cat or same_cls):
+        return False
+    dist = _center_dist(det, sup.get('last_det', det))
+    iou = _iou(_bbox(det), sup.get('bbox', _bbox(det)))
+    return dist <= STATIONARY_SUPPRESS_CENTER_THRESHOLD or iou >= STATIONARY_SUPPRESS_IOU_THRESHOLD
+
+def _remember_stationary_suppression(tr, now):
+    _prune_stationary_suppressions(now)
+    sup = {
+        'cls': tr.get('cls'),
+        'cat': tr.get('cat'),
+        'name': tr.get('name'),
+        'bbox': tr.get('bbox'),
+        'last_det': tr.get('last_det', {}).copy(),
+        'last_seen': now,
+        'source_track_id': tr.get('id'),
+    }
+    for i, existing in enumerate(stationary_suppressions):
+        if _stationary_match(sup['last_det'], existing):
+            stationary_suppressions[i] = sup
+            return
+    stationary_suppressions.append(sup)
+    print(f'[events] stationary suppress track {tr.get("id")} {tr.get("name")}', flush=True)
+
+def _suppressed_stationary_detection(det, now):
+    _prune_stationary_suppressions(now)
+    for sup in stationary_suppressions:
+        if _stationary_match(det, sup):
+            sup['bbox'] = _bbox(det)
+            sup['last_det'] = det.copy()
+            sup['last_seen'] = now
+            return sup
+    return None
 
 def _write_event(kind, tr, now):
     try:
@@ -904,6 +953,7 @@ def _expire_tracks(now=None):
                     tr['num_frames'] = video_meta.get('num_frames')
                     tr['record_fps'] = video_meta.get('record_fps')
                 _write_event('end', tr, now)
+                _remember_stationary_suppression(tr, now)
                 msg = 'data: ' + json.dumps({'_save': True, 'track_id': tid,
                                               'name': tr.get('name', '?'),
                                               'hits': tr.get('hits', 0),
@@ -939,6 +989,14 @@ def _update_track(det):
                 best_id, best_score = tid, score
 
         if best_id is None:
+            sup = _suppressed_stationary_detection(det, now)
+            if sup:
+                det['track_id'] = sup.get('source_track_id')
+                det['track_hits'] = 0
+                det['track_confirmed'] = False
+                det['track_suppressed'] = True
+                return det
+
             best_id = next_track_id
             next_track_id += 1
             tracks[best_id] = {
