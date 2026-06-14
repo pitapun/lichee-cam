@@ -750,10 +750,10 @@ def _run_ffmpeg(frames_dir, out_mp4, fps, h264_in=None):
         cmds = [
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
              '-framerate', rfps, '-i', h264_in, '-c:v', 'copy',
-             '-metadata:s:v:0', 'rotate=180', out_mp4],
+             out_mp4],
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
              '-framerate', rfps, '-i', h264_in, '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p',
-             '-metadata:s:v:0', 'rotate=180', out_mp4],
+             out_mp4],
         ]
         for cmd in cmds:
             try:
