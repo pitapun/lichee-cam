@@ -9,14 +9,14 @@
 body{font-family:monospace;background:#111;color:#eee;display:flex;flex-direction:column;height:100vh;overflow:hidden}
 
 /* top nav */
-#topnav{display:flex;align-items:stretch;height:58px;background:#141414;border-bottom:1px solid #2a2a2a;padding:0 12px;flex:0 0 auto;gap:0;min-width:0}
-#nav-brand{font-size:12px;letter-spacing:.12em;color:#8cf;font-weight:bold;margin-right:16px;user-select:none;display:flex;align-items:center;flex:0 0 auto}
+#topnav{display:flex;align-items:stretch;height:46px;background:#141414;border-bottom:1px solid #2a2a2a;padding:0 8px;flex:0 0 auto;gap:0;min-width:0}
+#nav-brand{font-size:11px;letter-spacing:.12em;color:#8cf;font-weight:bold;margin-right:12px;user-select:none;display:flex;align-items:center;flex:0 0 auto}
 #nav-tabs{display:flex;height:100%;flex:0 0 auto}
-.nav-tab{padding:0 14px;height:100%;background:transparent;border:0;border-bottom:3px solid transparent;font-family:monospace;font-size:11px;letter-spacing:.08em;color:#555;cursor:pointer;text-transform:uppercase;transition:color .12s;white-space:nowrap}
+.nav-tab{padding:0 10px;height:100%;background:transparent;border:0;border-bottom:3px solid transparent;font-family:monospace;font-size:10px;letter-spacing:.08em;color:#555;cursor:pointer;text-transform:uppercase;transition:color .12s;white-space:nowrap}
 .nav-tab:hover{color:#aaa}
 .nav-tab.active{color:#8cf;border-bottom-color:#8cf}
-#nav-status{margin-left:12px;font-size:11px;color:#555;display:flex;align-items:center;gap:8px;flex:0 0 auto;min-width:0}
-#status{color:#8cf;font-size:11px}
+#nav-status{margin-left:8px;font-size:10px;color:#555;display:flex;align-items:center;gap:6px;flex:0 0 auto;min-width:0}
+#status{display:none;color:#8cf;font-size:10px}
 
 /* main tab pages */
 .main-tab{display:none;flex:1;min-height:0;overflow:hidden}
@@ -27,8 +27,8 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 #zone-panel .panel-head{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:4px;margin-bottom:6px;letter-spacing:.1em;text-transform:uppercase}
 .zp-section{display:flex;flex-direction:column;gap:4px}
 .zp-section h3{font-size:10px;color:#555;letter-spacing:.08em;text-transform:uppercase;margin-bottom:2px}
-#pipeline-panel{flex:1 1 auto;min-width:0;padding:6px 10px;background:#141414;display:flex;align-items:stretch;overflow-x:auto;font-size:12px;gap:8px;border-left:1px solid #222}
-#pipeline-panel>.panel-head{display:flex;align-items:center;border-bottom:0;border-right:1px solid #222;padding:0 8px 0 0;margin:0;flex:0 0 auto}
+#pipeline-panel{flex:1 1 auto;min-width:0;padding:4px 6px;background:#141414;display:flex;align-items:stretch;overflow:hidden;font-size:11px;gap:5px;border-left:1px solid #222}
+#pipeline-panel>.panel-head{display:none}
 .panel-head{font-size:10px;color:#555;border-bottom:1px solid #222;padding-bottom:4px;margin-bottom:10px;letter-spacing:.1em;text-transform:uppercase}
 #live-video-slot,#zone-video-slot{flex:1;min-width:0;min-height:0;position:relative;display:flex}
 #stream-area{flex:1;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}
@@ -40,9 +40,9 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 
 /* pipeline */
 .pipeline{display:flex;align-items:stretch;gap:0;min-width:max-content}
-.pnode{border:1px solid #2a2a2a;padding:5px 8px;background:#1a1a1a;transition:background .15s,border-color .15s;cursor:default}
-.pnode .pname{font-size:10px;font-weight:bold;color:#555;letter-spacing:.03em;transition:color .15s;white-space:nowrap}
-.pnode .pinfo{font-size:9px;color:#444;margin-top:2px;min-height:10px;transition:color .15s;white-space:nowrap}
+.pnode{border:1px solid #2a2a2a;padding:4px 6px;background:#1a1a1a;transition:background .15s,border-color .15s;cursor:default}
+.pnode .pname{font-size:9px;font-weight:bold;color:#555;letter-spacing:.03em;transition:color .15s;white-space:nowrap}
+.pnode .pinfo{font-size:8px;color:#444;margin-top:1px;min-height:9px;max-width:58px;overflow:hidden;transition:color .15s;white-space:nowrap}
 .pnode.active{background:#0d2a0d;border-color:#2a6a2a}
 .pnode.active .pname{color:#4f4}
 .pnode.active .pinfo{color:#2a2}
@@ -50,9 +50,9 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 .pnode.flash-save .pname{color:#4fa}
 .pnode.flash-discard{background:#2a1a0d;border-color:#6a4a2a}
 .pnode.flash-discard .pname{color:#fa8}
-.parrow{display:flex;align-items:center;text-align:center;color:#333;font-size:12px;line-height:1;margin:0 2px;user-select:none}
+.parrow{display:flex;align-items:center;text-align:center;color:#333;font-size:11px;line-height:1;margin:0 1px;user-select:none}
 .parrow.active{color:#2a6a2a}
-.pardiv{display:flex;align-items:center;gap:5px;color:#333;font-size:10px;line-height:1;margin:0 4px;white-space:nowrap}
+.pardiv{display:flex;align-items:center;gap:3px;color:#333;font-size:9px;line-height:1;margin:0 2px;white-space:nowrap}
 .pstat{margin-top:14px;border-top:1px solid #222;padding-top:10px;display:flex;flex-direction:column;gap:6px}
 .st-row{display:flex;flex-direction:column;gap:1px}
 .st-label{font-size:10px;color:#555}
@@ -146,21 +146,21 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
       </div>
       <div class="parrow" id="pa-motion">&#x25B6;</div>
       <div class="pnode" id="pn-ai">
-        <div class="pname">AI DETECT</div>
+        <div class="pname">AI</div>
         <div class="pinfo" id="pi-ai">-</div>
       </div>
       <div class="parrow" id="pa-ai">&#x25B6;</div>
       <div class="pnode" id="pn-track">
-        <div class="pname">TRACKING</div>
+        <div class="pname">TRK</div>
         <div class="pinfo" id="pi-track">-</div>
       </div>
       <div class="pardiv" id="pa-track">
-        <span>&#x25C4; discard</span>
+        <span>&#x25C4; drop</span>
         <span>save &#x25BA;</span>
       </div>
       <div style="display:flex;gap:5px">
         <div class="pnode" id="pn-discard" style="flex:1">
-          <div class="pname">DISCARD</div>
+          <div class="pname">DROP</div>
           <div class="pinfo" id="pi-discard"></div>
         </div>
         <div class="pnode" id="pn-save" style="flex:1">
