@@ -51,6 +51,10 @@ DEFAULT_CONFIG = {
     # Sensor resolution. Supported by gc4653 driver: 1280x720, 1920x1080, 2560x1440.
     'sensor_width':  1280,
     'sensor_height': 720,
+    # HLS encoder output size. May be smaller than sensor_*; stream_yolo
+    # downscales CHN0 BGR to this before NV21 encoding. Default = sensor size.
+    'hls_width':  1280,
+    'hls_height': 720,
     # Frame-rate cap for stream_yolo main loop. Lower = less CPU = cooler SoC.
     # 0 means uncapped (sensor max ~30fps).
     'target_fps': 15,
@@ -838,13 +842,16 @@ def _fmt_fps(fps):
 def _run_ffmpeg(frames_dir, out_mp4, fps, h264_in=None, h264_fps=None):
     if h264_in and os.path.exists(h264_in):
         rfps = _fmt_fps(h264_fps or _effective_hls_fps(fps))
+        # CHN1 raw VI bypasses the VPSS bMirror+bFlip rotation, so the
+        # encoded stream is upside down. Tag rotation in mp4 metadata so
+        # conformant players display it right-side-up without re-encoding.
         cmds = [
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
              '-framerate', rfps, '-i', h264_in, '-c:v', 'copy',
-             out_mp4],
+             '-metadata:s:v:0', 'rotate=180', out_mp4],
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
              '-framerate', rfps, '-i', h264_in, '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p',
-             out_mp4],
+             '-metadata:s:v:0', 'rotate=180', out_mp4],
         ]
         for cmd in cmds:
             try:
@@ -1190,6 +1197,14 @@ def _start_yolo_inner():
         sh = int(cfg.get('sensor_height', 720))
         if (sw, sh) not in SENSOR_RES_OPTIONS:
             sw, sh = 1280, 720
+        # HLS encoder output. Defaults to sensor size if not configured or
+        # if the configured value exceeds the sensor (CHN0 is the source).
+        hw = int(cfg.get('hls_width')  or sw)
+        hh = int(cfg.get('hls_height') or sh)
+        hw = max(64, min(hw, sw))
+        hh = max(64, min(hh, sh))
+        env['YOLO_HLS_W'] = str(hw)
+        env['YOLO_HLS_H'] = str(hh)
         # Build --zones "x,y;x,y;..." (clamped to frame). Empty list -> auto-
         # populate a single center zone and persist, so the UI yellow box
         # matches what stream_yolo actually crops.
@@ -1812,6 +1827,16 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
       <button onclick="rebootDevice()" style="margin-left:6px">Reboot</button>
     </div>
     <div class="s-row">
+      <span class="s-label">HLS stream</span>
+      <select id="hlsRes" style="flex:1">
+        <option value="640,360">640 x 360</option>
+        <option value="854,480">854 x 480</option>
+        <option value="1280,720">1280 x 720</option>
+        <option value="1920,1080">1920 x 1080</option>
+        <option value="2560,1440">2560 x 1440</option>
+      </select>
+    </div>
+    <div class="s-row">
       <span class="s-label">FPS cap</span>
       <input type="range" id="fpsCap" min="0" max="30" step="1" value="15" style="flex:1"
              oninput="document.getElementById('fpsv').textContent=this.value==0?'off':this.value">
@@ -1924,8 +1949,12 @@ function loadConf(){
       cfg.active_detector = !!c.active_detector;
       cfg.sensor_width = c.sensor_width||1280;
       cfg.sensor_height= c.sensor_height||720;
+      cfg.hls_width  = c.hls_width  || cfg.sensor_width;
+      cfg.hls_height = c.hls_height || cfg.sensor_height;
       const sr=document.getElementById('senRes');
       if(sr) sr.value=cfg.sensor_width+','+cfg.sensor_height;
+      const hr=document.getElementById('hlsRes');
+      if(hr) hr.value=cfg.hls_width+','+cfg.hls_height;
       const fc=document.getElementById('fpsCap');
       const tfps=(c.target_fps==null)?15:c.target_fps;
       if(fc){fc.value=tfps; document.getElementById('fpsv').textContent=tfps==0?'off':tfps;}
@@ -2417,6 +2446,12 @@ function applyAll(){
   const sr=document.getElementById('senRes').value.split(',');
   cfg.sensor_width=parseInt(sr[0]);
   cfg.sensor_height=parseInt(sr[1]);
+  const hr=document.getElementById('hlsRes');
+  if(hr){
+    const hv=hr.value.split(',');
+    cfg.hls_width =parseInt(hv[0]);
+    cfg.hls_height=parseInt(hv[1]);
+  }
   const sw=cfg.sensor_width, sh=cfg.sensor_height;
   (cfg.detection_zones||[]).forEach(z=>{
     z.size=Math.max(INFER_SZ,z.size||INFER_SZ);  // minimum size only; zone may exceed frame

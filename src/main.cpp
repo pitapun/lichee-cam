@@ -163,8 +163,9 @@ public:
                     saved_w(0), saved_h(0), saved_fps(0), drain_requested_(false) {}
 
     bool start(int w, int h, int fps) {
-        // cap HLS at 1280x720 — CHN0 is live-view only; high-res uses CHN1
-        if (w > 1280 || h > 720) { w = 1280; h = 720; }
+        // Sanity floor — encoder rejects sub-multiples of 16.
+        if (w < 64) w = 64;
+        if (h < 64) h = 64;
         saved_w = w; saved_h = h; saved_fps = fps;
         sps_nalu.reserve(256);
         pps_nalu.reserve(256);
@@ -884,6 +885,11 @@ int main(int argc, char *argv[]) {
     // more frames per second than the pipeline produced.
     int hls_fps = (target_fps > 0) ? std::min(target_fps, 5) : 5;
     int event_fps = target_fps > 0 ? target_fps : 25;
+    // HLS output size: env override (set by sidecar), default to disp size.
+    // Sidecar exposes this as a user-facing setting.
+    int hls_w = disp_w, hls_h = disp_h;
+    if (const char* env_w = getenv("YOLO_HLS_W")) { int v = atoi(env_w); if (v > 0) hls_w = v; }
+    if (const char* env_h = getenv("YOLO_HLS_H")) { int v = atoi(env_h); if (v > 0) hls_h = v; }
     long last_mjpeg_ms = 0;
     const long MJPEG_FORCE_MS = ENABLE_HLS ? 2000 : 500;
     const char *HD_RECORD_CONTROL = "/tmp/ninti_hd_record_dir";
@@ -1000,8 +1006,10 @@ int main(int argc, char *argv[]) {
     // Start HLS VENC before the main loop so CreateChn never runs while a VI
     // frame is in-flight (which causes VI GetChnFrame to block permanently).
     if (ENABLE_HLS) {
-        if (!hlsrec.start(disp_w, disp_h, hls_fps))
+        if (!hlsrec.start(hls_w, hls_h, hls_fps))
             fprintf(stderr, "[hls] start failed — HLS disabled\n");
+        else
+            fprintf(stderr, "[hls] start %dx%d@%d\n", hls_w, hls_h, hls_fps);
     }
 
     struct timespec frame_start_ts;
