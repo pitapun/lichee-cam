@@ -988,6 +988,52 @@ int main(int argc, char *argv[]) {
     long acc_cap=0, acc_motion=0, acc_infer=0, acc_nms_draw=0, acc_mjpeg=0;
     long acc_clone=0, acc_hls_send=0;
 
+    // ---- Async NPU detector ----
+    // The cvi_tdl forward + post-process takes ~330ms per tile. Running it
+    // inline pinned event recording fps to ~3 fps. The worker below owns
+    // detector.detect() on its own thread; the main loop submits the latest
+    // tile (single-slot, latest wins) and reads results from zone_cache
+    // when drawing. detector is set up before the thread starts; only this
+    // worker calls detect()/free_objects() afterwards.
+    std::mutex infer_mtx;
+    std::condition_variable infer_cv;
+    struct InferReq { cv::Mat tile; Zone zone; int z_idx; };
+    InferReq infer_pending;
+    bool infer_pending_valid = false;
+    std::atomic<bool> infer_stop(false);
+    std::thread infer_thr([&]{
+        while (!infer_stop.load()) {
+            InferReq req;
+            {
+                std::unique_lock<std::mutex> lk(infer_mtx);
+                infer_cv.wait(lk, [&]{ return infer_pending_valid || infer_stop.load(); });
+                if (infer_stop.load()) break;
+                req = std::move(infer_pending);
+                infer_pending_valid = false;
+            }
+            cvtdl_object_t objs = detector.detect(req.tile);
+            std::vector<TileDet> dets;
+            const float sc = (float)req.zone.size / (float)infer_size;
+            for (uint32_t i = 0; i < objs.size; i++) {
+                if (!category(objs.info[i].classes)) continue;
+                TileDet td;
+                td.dx1 = (int)(objs.info[i].bbox.x1 * sc) + req.zone.x;
+                td.dy1 = (int)(objs.info[i].bbox.y1 * sc) + req.zone.y;
+                td.dx2 = (int)(objs.info[i].bbox.x2 * sc) + req.zone.x;
+                td.dy2 = (int)(objs.info[i].bbox.y2 * sc) + req.zone.y;
+                td.score = objs.info[i].bbox.score;
+                td.cls   = objs.info[i].classes;
+                dets.push_back(td);
+            }
+            detector.free_objects(&objs);
+            {
+                std::lock_guard<std::mutex> lk(infer_mtx);
+                if (req.z_idx >= 0 && req.z_idx < (int)zone_cache.size())
+                    zone_cache[req.z_idx] = std::move(dets);
+            }
+        }
+    });
+
     // Pre-init CHN1 (event recorder) before the main loop so the first event
     // recording never stalls the loop with a 1-2s CVI_VENC_CreateChn call.
     // Capture one raw frame to discover sensor dimensions, then release it.
@@ -1202,15 +1248,16 @@ int main(int argc, char *argv[]) {
 
         // Clear stale boxes once we go idle so UDP stops emitting old detections
         if (!npu_active) {
+            std::lock_guard<std::mutex> lk(infer_mtx);
             for (size_t i = 0; i < zone_cache.size(); i++) zone_cache[i].clear();
         }
 
-        // Inference frame skip: only run NPU every INFER_EVERY frames, and only when motion active
+        // Submit a tile to the async detector when motion is active. Single
+        // in-flight — if the worker is still chewing the previous tile we
+        // overwrite the pending slot so it picks up the freshest frame next.
         if (ENABLE_NPU && !hd_recording && npu_active && frame_count % INFER_EVERY == 0) {
             int z = active_zone;
             const Zone &zone = zones[z];
-            // Padded crop: zone may extend beyond frame — out-of-bounds area filled black.
-            // Scale visible portion directly into infer_size tile to avoid large intermediate buffer.
             tile_sq.create(infer_size, infer_size, disp.type());
             tile_sq.setTo(cv::Scalar(0, 0, 0));
             int sx = std::max(0, zone.x), sy = std::max(0, zone.y);
@@ -1229,31 +1276,26 @@ int main(int argc, char *argv[]) {
                                cv::Size(dw, dh), 0, 0, interp);
                 }
             }
-
-            cvtdl_object_t objs = detector.detect(tile_sq);
-            zone_cache[z].clear();
-            const float sc = (float)zone.size / (float)infer_size;
-            for (uint32_t i = 0; i < objs.size; i++) {
-                if (!category(objs.info[i].classes)) continue;
-                TileDet td;
-                td.dx1 = (int)(objs.info[i].bbox.x1 * sc) + zone.x;
-                td.dy1 = (int)(objs.info[i].bbox.y1 * sc) + zone.y;
-                td.dx2 = (int)(objs.info[i].bbox.x2 * sc) + zone.x;
-                td.dy2 = (int)(objs.info[i].bbox.y2 * sc) + zone.y;
-                td.score = objs.info[i].bbox.score;
-                td.cls   = objs.info[i].classes;
-                zone_cache[z].push_back(td);
+            {
+                std::lock_guard<std::mutex> lk(infer_mtx);
+                infer_pending.tile = tile_sq.clone();
+                infer_pending.zone = zone;
+                infer_pending.z_idx = z;
+                infer_pending_valid = true;
             }
-            detector.free_objects(&objs);
+            infer_cv.notify_one();
             active_zone = (active_zone + 1) % (int)zones.size();
         }
         frame_count++;
         long t3 = now_ms(); acc_infer += t3 - t2;
 
-        // Merge all zone caches
+        // Merge all zone caches (worker thread writes into them).
         all_dets.clear();
-        for (size_t i = 0; i < zone_cache.size(); i++)
-            all_dets.insert(all_dets.end(), zone_cache[i].begin(), zone_cache[i].end());
+        {
+            std::lock_guard<std::mutex> lk(infer_mtx);
+            for (size_t i = 0; i < zone_cache.size(); i++)
+                all_dets.insert(all_dets.end(), zone_cache[i].begin(), zone_cache[i].end());
+        }
 
         // Cross-tile NMS: suppress lower-score duplicate that overlaps >40% IoU
         suppressed.assign(all_dets.size(), false);
@@ -1360,6 +1402,11 @@ int main(int argc, char *argv[]) {
 
     shutdown_stage("main loop exited");
     printf("Stopping...\n");
+    shutdown_stage("before infer thread stop");
+    infer_stop = true;
+    infer_cv.notify_all();
+    if (infer_thr.joinable()) infer_thr.join();
+    shutdown_stage("after infer thread stop");
     shutdown_stage("before hlsrec.stop");
     hlsrec.stop();
     shutdown_stage("after hlsrec.stop");
