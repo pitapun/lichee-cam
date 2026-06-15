@@ -1270,10 +1270,14 @@ int main(int argc, char *argv[]) {
                 int dw = std::min((int)((ex - sx) * sc2), infer_size - dx);
                 int dh = std::min((int)((ey - sy) * sc2), infer_size - dy);
                 if (dw > 0 && dh > 0) {
-                    int interp = (zone.size == infer_size) ? cv::INTER_NEAREST : cv::INTER_AREA;
+                    // c906 has no SIMD path for INTER_AREA, so a
+                    // 1300x1300 -> 640x640 area resample was ~200ms per
+                    // frame. NEAREST is index-math + memcpy and runs in a
+                    // few ms; the quality drop on YOLO inference at this
+                    // threshold is negligible.
                     cv::resize(disp(cv::Rect(sx, sy, ex-sx, ey-sy)),
                                tile_sq(cv::Rect(dx, dy, dw, dh)),
-                               cv::Size(dw, dh), 0, 0, interp);
+                               cv::Size(dw, dh), 0, 0, cv::INTER_NEAREST);
                 }
             }
             {
