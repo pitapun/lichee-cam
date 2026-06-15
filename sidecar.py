@@ -160,7 +160,7 @@ def _ws_status_loop():
 TRACK_IOU_THRESHOLD = 0.20
 TRACK_CENTER_THRESHOLD = 0.25
 TRACK_CONFIRM_HITS = 2
-TRACK_LOST_TIMEOUT = 5.0    # object not detected for 5s -> gone
+TRACK_LOST_TIMEOUT = 2.5    # object not detected for 2.5s -> gone
 TRACK_STILL_TIMEOUT = 5.0   # object not moving for 5s -> gone
 TRACK_MOVE_THRESHOLD = 0.04 # min center shift (normalised) to count as movement
 STATIONARY_SUPPRESS_ABSENT_TIMEOUT = 60.0
