@@ -85,6 +85,7 @@ latest_stream_id = 0
 stream_clients = 0
 
 PRE_BUFFER_SECS = 2.0
+H264_PREROLL_SECS = 2.5
 _pre_buf = collections.deque()  # (t, jpg_bytes) — rolling 3s window
 _pre_buf_lock = threading.Lock()
 
@@ -795,9 +796,48 @@ def _storage_cleanup_loop():
         _cleanup_event_storage()
         time.sleep(EVENT_STORAGE_CHECK_SEC)
 
-def _run_ffmpeg(frames_dir, out_mp4, fps, h264_in=None):
-    rfps = str(int(fps)) if fps == int(fps) else str(fps)
+def _effective_hls_fps(fps=None):
+    if fps is None:
+        with config_lock:
+            fps = cfg.get('target_fps', 0) or 5
+    try:
+        fps = int(float(fps))
+    except Exception:
+        fps = 5
+    return max(1, min(fps, 5))
+
+def _count_h264_frames(h264_in):
+    try:
+        out = subprocess.check_output([
+            'ffprobe', '-v', 'error', '-f', 'h264', '-count_frames',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=nb_read_frames',
+            '-of', 'default=nw=1:nk=1', h264_in
+        ], stderr=subprocess.DEVNULL, timeout=10).decode().strip()
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+    except Exception:
+        pass
+    return None
+
+def _h264_remux_fps(h264_in, duration_s, fallback_fps):
+    frames = _count_h264_frames(h264_in)
+    if frames and duration_s > 0.1:
+        return max(0.1, min(60.0, frames / duration_s))
+    return fallback_fps
+
+def _fmt_fps(fps):
+    try:
+        fps = float(fps)
+    except Exception:
+        fps = float(EVENT_VIDEO_FPS)
+    return str(int(fps)) if fps == int(fps) else f'{fps:.3f}'.rstrip('0').rstrip('.')
+
+def _run_ffmpeg(frames_dir, out_mp4, fps, h264_in=None, h264_fps=None):
     if h264_in and os.path.exists(h264_in):
+        rfps = _fmt_fps(h264_fps or _effective_hls_fps(fps))
         cmds = [
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
              '-framerate', rfps, '-i', h264_in, '-c:v', 'copy',
@@ -813,10 +853,11 @@ def _run_ffmpeg(frames_dir, out_mp4, fps, h264_in=None):
             except Exception:
                 pass
     pattern = os.path.join(frames_dir, 'frame_%05d.jpg')
+    rfps = _fmt_fps(fps)
     cmds = [
-        ['ffmpeg', '-y', '-loglevel', 'error', '-framerate', str(fps),
+        ['ffmpeg', '-y', '-loglevel', 'error', '-framerate', rfps,
          '-i', pattern, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', out_mp4],
-        ['ffmpeg', '-y', '-loglevel', 'error', '-framerate', str(fps),
+        ['ffmpeg', '-y', '-loglevel', 'error', '-framerate', rfps,
          '-i', pattern, '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p', out_mp4],
     ]
     for cmd in cmds:
@@ -884,7 +925,12 @@ def _finish_event_video(tr, save, now):
         best = os.path.join(frames_dir, frame_files[len(frame_files)//2])
         thumb_ok = subprocess.call(['cp', best, os.path.join(event_dir, 'best_frame.jpg')]) == 0
     out_mp4 = os.path.join(event_dir, 'event.mp4')
-    ok = _run_ffmpeg(frames_dir, out_mp4, rec['fps'], h264_in)
+    if os.path.exists(h264_in):
+        h264_duration = max(0.1, now - rec.get('started_at', now) + H264_PREROLL_SECS)
+        record_fps = _h264_remux_fps(h264_in, h264_duration, _effective_hls_fps(rec['fps']))
+    else:
+        record_fps = rec['fps']
+    ok = _run_ffmpeg(frames_dir, out_mp4, rec['fps'], h264_in, record_fps)
     if ok and not thumb_ok:
         thumb_ok = subprocess.call([
             'ffmpeg', '-y', '-loglevel', 'error', '-i', out_mp4,
@@ -901,7 +947,7 @@ def _finish_event_video(tr, save, now):
         'duration_s': round(now - tr.get('first_seen', now), 3),
         'hits': tr.get('hits', 0),
         'best_score': tr.get('best_score', 0),
-        'record_fps': rec['fps'],
+        'record_fps': record_fps,
         'num_frames': len(frame_files),
         'video_ok': ok,
         'event_dir': event_url,
@@ -1071,9 +1117,7 @@ def _start_hls_ffmpeg():
     global _hls_proc
     if not HLS_ENABLED:
         return
-    with config_lock:
-        hls_fps = int(cfg.get('target_fps', 0) or 5)
-    hls_fps = max(1, min(hls_fps, 5))
+    hls_fps = _effective_hls_fps()
     os.makedirs(HLS_DIR, exist_ok=True)
     if not os.path.exists(HLS_FIFO):
         os.mkfifo(HLS_FIFO)
