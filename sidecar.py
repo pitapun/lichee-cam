@@ -167,6 +167,7 @@ STATIONARY_SUPPRESS_ABSENT_TIMEOUT = 60.0
 STATIONARY_SUPPRESS_CENTER_THRESHOLD = 0.20
 STATIONARY_SUPPRESS_IOU_THRESHOLD = 0.05
 MIN_RECORD_SECS = 3.0       # minimum recording duration after confirmation
+MAX_RECORD_SECS = 12.0      # hard cap for a single saved event
 
 cfg = DEFAULT_CONFIG.copy()
 if os.path.exists(CONFIG_FILE):
@@ -934,7 +935,8 @@ def _expire_tracks(now=None):
             else:
                 lost  = now - tr.get('last_seen',  now) > TRACK_LOST_TIMEOUT
                 still = now - tr.get('last_moved', now) > TRACK_STILL_TIMEOUT
-            if (lost or still) and now >= tr.get('min_record_until', 0):
+            maxed = tr.get('confirmed') and now - tr.get('first_seen', now) >= MAX_RECORD_SECS
+            if (lost or still or maxed) and now >= tr.get('min_record_until', 0):
                 expired.append(tid)
         for tid in expired:
             tr = tracks.pop(tid, {})
