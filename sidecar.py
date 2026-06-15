@@ -162,6 +162,7 @@ TRACK_CENTER_THRESHOLD = 0.25
 TRACK_CONFIRM_HITS = 2
 TRACK_LOST_TIMEOUT = 2.5    # object not detected for 2.5s -> gone
 TRACK_STILL_TIMEOUT = 5.0   # object not moving for 5s -> gone
+RECORD_STILL_TIMEOUT = 2.5  # during recording, stationary object ends the clip
 TRACK_MOVE_THRESHOLD = 0.04 # min center shift (normalised) to count as movement
 STATIONARY_SUPPRESS_ABSENT_TIMEOUT = 60.0
 STATIONARY_SUPPRESS_CENTER_THRESHOLD = 0.20
@@ -926,12 +927,9 @@ def _expire_tracks(now=None):
     with tracks_lock:
         for tid, tr in list(tracks.items()):
             recording = tid in recording_ids
-            # While a recorder is active, only use LOST check (not STILL).
-            # Detection pauses during recording, so LOST also acts as the
-            # event recording timeout after min_record_until.
             if recording:
                 lost  = now - tr.get('last_seen', now) > TRACK_LOST_TIMEOUT
-                still = False
+                still = now - tr.get('last_moved', now) > RECORD_STILL_TIMEOUT
             else:
                 lost  = now - tr.get('last_seen',  now) > TRACK_LOST_TIMEOUT
                 still = now - tr.get('last_moved', now) > TRACK_STILL_TIMEOUT
