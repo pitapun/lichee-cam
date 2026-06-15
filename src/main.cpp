@@ -883,6 +883,7 @@ int main(int argc, char *argv[]) {
     // fast-forward during playback because the H264 stream timestamps imply
     // more frames per second than the pipeline produced.
     int hls_fps = (target_fps > 0) ? std::min(target_fps, 5) : 5;
+    int event_fps = target_fps > 0 ? target_fps : 25;
     long last_mjpeg_ms = 0;
     const long MJPEG_FORCE_MS = ENABLE_HLS ? 2000 : 500;
     const char *HD_RECORD_CONTROL = "/tmp/ninti_hd_record_dir";
@@ -984,13 +985,15 @@ int main(int argc, char *argv[]) {
     // Pre-init CHN1 (event recorder) before the main loop so the first event
     // recording never stalls the loop with a 1-2s CVI_VENC_CreateChn call.
     // Capture one raw frame to discover sensor dimensions, then release it.
+    int chn1_w = 0, chn1_h = 0;
     {
         VIDEO_FRAME_INFO_S* raw_f = (VIDEO_FRAME_INFO_S*)cap.captureRaw();
         if (raw_f) {
             VIDEO_FRAME_S& vf = raw_f->stVFrame;
+            chn1_w = (int)vf.u32Width;
+            chn1_h = (int)vf.u32Height;
             cap.releaseImagePtr();  // release before CreateChn (avoids VI stall)
-            int rec_fps = target_fps > 0 ? target_fps : 25;
-            h264rec.init((int)vf.u32Width, (int)vf.u32Height, rec_fps);
+            h264rec.init(chn1_w, chn1_h, event_fps);
         }
     }
 
@@ -1031,7 +1034,7 @@ int main(int argc, char *argv[]) {
                 if (!hd_record_dir.empty() && raw_frame) {
                     VIDEO_FRAME_S& vf = raw_frame->stVFrame;
                     std::string h264_path = dirname_of(hd_record_dir) + "/event.h264";
-                    h264rec.start(h264_path, (int)vf.u32Width, (int)vf.u32Height, 25);
+                    h264rec.start(h264_path, (int)vf.u32Width, (int)vf.u32Height, event_fps);
                     fprintf(stderr, "[hdrec/raw] start dir=%s h264=%s\n",
                             hd_record_dir.c_str(), h264_path.c_str());
                 }
@@ -1093,19 +1096,26 @@ int main(int argc, char *argv[]) {
         std::string requested_hd_dir = read_hd_record_dir();
         if (requested_hd_dir != hd_record_dir) {
             if (!hd_record_dir.empty()) {
-                hlsrec.stop_event_record();
+                h264rec.stop();
                 write_hd_done(hd_record_dir);
             }
             hd_record_dir = requested_hd_dir;
             hd_record_idx = 0;
             last_hd_record_ms = ts - HD_RECORD_INTERVAL_MS;
-            if (!hd_record_dir.empty() && original_frame) {
+            if (!hd_record_dir.empty() && original_frame && chn1_w > 0) {
                 std::string h264_path = dirname_of(hd_record_dir) + "/event.h264";
-                hlsrec.start_event_record(h264_path, 2500);
-                fprintf(stderr, "[hdrec] start dir=%s h264=%s\n", hd_record_dir.c_str(), h264_path.c_str());
+                h264rec.start(h264_path, chn1_w, chn1_h, event_fps);
+                fprintf(stderr, "[hdrec] start dir=%s h264=%s %dx%d\n",
+                        hd_record_dir.c_str(), h264_path.c_str(), chn1_w, chn1_h);
             }
         }
         bool hd_recording = !hd_record_dir.empty();
+        // Feed the raw VI frame (sensor resolution, e.g. 2560x1440) to the
+        // CHN1 H264 encoder while the event is active. Must run before
+        // cap.releaseImagePtr() below, which releases original_frame.
+        if (hd_recording && original_frame) {
+            h264rec.send(original_frame);
+        }
         if (ENABLE_HLS && hlsrec.is_active() && !disp.empty()) {
             // IDR requests are now issued by the drain thread after each drain —
             // calling RequestIDR from the main thread blocks while drain polls VENC.
@@ -1342,9 +1352,9 @@ int main(int argc, char *argv[]) {
         shutdown_stage("after hls ion free");
     }
     if (!hd_record_dir.empty()) {
-        shutdown_stage("before hls event stop");
-        hlsrec.stop_event_record();
-        shutdown_stage("after hls event stop");
+        shutdown_stage("before h264rec.stop event");
+        h264rec.stop();
+        shutdown_stage("after h264rec.stop event");
         shutdown_stage("before write hd done");
         write_hd_done(hd_record_dir);
         shutdown_stage("after write hd done");
