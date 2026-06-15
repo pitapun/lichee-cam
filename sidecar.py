@@ -1316,14 +1316,14 @@ def _rss_logger():
     cleanly (no VPSS/ION stuck state) and avoids the reboot path."""
     log_path = '/tmp/stream_yolo_rss.log'
     events_dir = '/root/ninti_events'
-    # Trigger restart at 30 MB RSS; OOM kicks in around 50-60 MB on this
-    # 128 MB device. Also restart if VmData crosses 45 MB: the remaining
-    # growth is mostly virtual mappings, but bounding it avoids finding out
-    # later that a retained extent can become resident under pressure.
-    # Cool-off prevents restart loops if jemalloc has a one-time high-water
-    # mark that resists shrinking.
-    RSS_RESTART_KB = 30_000
-    DATA_RESTART_KB = 45_000
+    # OOM kicks in around 50-60 MB on this 128 MB device. Startup baseline
+    # is now ~35 MB once cvi_tdl model + VPSS / VENC buffers + jemalloc
+    # arenas + async detector thread have all settled; the old 30 MB
+    # threshold caused an immediate soft-restart loop. Bumped to 45 MB to
+    # leave ~15 MB of headroom before OOM. VmData scaled proportionally.
+    # Cool-off prevents restart storms if jemalloc holds a one-time peak.
+    RSS_RESTART_KB = 45_000
+    DATA_RESTART_KB = 60_000
     RSS_RESTART_COOL_S = 30 * 60
     last_pid = None
     last_restart_ts = 0
