@@ -1124,14 +1124,24 @@ int main(int argc, char *argv[]) {
         if (hd_recording && original_frame) {
             h264rec.send(original_frame);
         }
-        if (ENABLE_HLS && hlsrec.is_active() && !disp.empty()) {
-            // IDR requests are now issued by the drain thread after each drain —
-            // calling RequestIDR from the main thread blocks while drain polls VENC.
-            // Downscale to HLS resolution (capped at 1280x720 in HlsStreamer::start)
+        // Rate-limit HLS to its declared output rate. Previously this branch
+        // sent every loop iter, which over-fed VENC and made hlsrec.send()
+        // block in drain() for 600-2000ms — dragging the whole loop (and
+        // therefore event recording fps) down to ~1.
+        static long hls_last_ms = 0;
+        long hls_now = now_ms();
+        long hls_interval_ms = hls_fps > 0 ? 1000L / hls_fps : 200;
+        if (ENABLE_HLS && hlsrec.is_active() && !disp.empty()
+                && (hls_now - hls_last_ms) >= hls_interval_ms) {
+            hls_last_ms = hls_now;
             long pr_t0 = now_ms();
+            // INTER_NEAREST: scalar INTER_LINEAR on c906 ate ~700ms per
+            // 1920x1080 -> 1280x720 resize, choking the loop down to ~1 fps.
+            // NEAREST is index-math + memcpy and runs in ~50ms; HLS at 5fps
+            // is a preview stream, the quality drop is invisible.
             if (disp.cols != hlsrec.get_w() || disp.rows != hlsrec.get_h())
                 cv::resize(disp, hls_frame, cv::Size(hlsrec.get_w(), hlsrec.get_h()),
-                           0, 0, cv::INTER_LINEAR);
+                           0, 0, cv::INTER_NEAREST);
             else
                 hls_frame = disp;
             VIDEO_FRAME_INFO_S* nv21 = prepare_hls_frame(hls_frame);
