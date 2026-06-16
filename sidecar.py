@@ -945,9 +945,15 @@ def _finish_event_video(tr, save, now):
         record_fps = rec['fps']
     ok = _run_ffmpeg(frames_dir, out_mp4, rec['fps'], h264_in, record_fps)
     if ok and not thumb_ok:
+        # Decoding a 2560x1440 mp4 to extract one frame at native size
+        # pushed ffmpeg over the OOM ceiling on this 128 MB box (sidecar +
+        # stream_yolo + HLS ffmpeg already use most of RAM). Force a single
+        # thread and scale during decode so the working set fits.
         thumb_ok = subprocess.call([
-            'ffmpeg', '-y', '-loglevel', 'error', '-i', out_mp4,
-            '-frames:v', '1', os.path.join(event_dir, 'best_frame.jpg')
+            'ffmpeg', '-y', '-loglevel', 'error', '-threads', '1',
+            '-i', out_mp4, '-frames:v', '1',
+            '-vf', 'scale=640:-2',
+            os.path.join(event_dir, 'best_frame.jpg')
         ]) == 0
     event_url = f'/event-video/{event_name}'
     meta = {
