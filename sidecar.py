@@ -89,7 +89,13 @@ latest_stream_id = 0
 stream_clients = 0
 
 PRE_BUFFER_SECS = 2.0
-H264_PREROLL_SECS = 2.5
+# Was 2.5 when events came from the HLS event recorder, which prepended
+# the last 2500ms of CHN0 H264 into event.h264. The new CHN1 raw VI
+# recorder (commit 936a01e) has no pre-roll, so adding 2.5 to the duration
+# made the computed remux fps artificially low (events looked like ~1 fps
+# on playback). Pre-roll was attempted on CHN1 and rolled back; keep this
+# at 0 until/unless a pre-roll mechanism actually lands.
+H264_PREROLL_SECS = 0.0
 _pre_buf = collections.deque()  # (t, jpg_bytes) — rolling 3s window
 _pre_buf_lock = threading.Lock()
 
