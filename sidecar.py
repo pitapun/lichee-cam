@@ -48,16 +48,24 @@ DEFAULT_CONFIG = {
     # frame on the previous frame's motion centroid (clamped to the frame).
     # UI renders this zone in orange instead of yellow.
     'active_detector': False,
-    # Sensor resolution. Supported by gc4653 driver: 1280x720, 1920x1080, 2560x1440.
-    'sensor_width':  1280,
-    'sensor_height': 720,
-    # HLS encoder output size. May be smaller than sensor_*; stream_yolo
-    # downscales CHN0 BGR to this before NV21 encoding. Default = sensor size.
+    # CHN0 BGR (YOLO + motion). Picked up by capture_cvi.cpp via
+    # cap.set(WIDTH/HEIGHT); also used as the fallback for hls_w/h and
+    # record_w/h when those are unset.
+    'sensor_width':  1920,
+    'sensor_height': 1080,
+    # CHN1 NV21 -> HLS encoder. Independent of CHN0; VPSS HW scales.
     'hls_width':  1280,
     'hls_height': 720,
-    # Frame-rate cap for stream_yolo main loop. Lower = less CPU = cooler SoC.
-    # 0 means uncapped (sensor max ~30fps).
-    'target_fps': 15,
+    'hls_fps': 5,
+    # CHN2 NV21 -> Record encoder. Independent of CHN0/CHN1.
+    'record_width':  1920,
+    'record_height': 1080,
+    'record_fps': 10,
+    # Sensor capture rate cap (target_fps). Per-chn fps is clamped to this.
+    'target_fps': 10,
+    # GC4653 is physically mounted upside-down; rotate 180 in VPSS HW.
+    # Applies to all three chns at once.
+    'rotation_180': True,
     'mqtt_enabled': False,
     'mqtt_host': '',
     'mqtt_port': 1883,
@@ -848,16 +856,15 @@ def _fmt_fps(fps):
 def _run_ffmpeg(frames_dir, out_mp4, fps, h264_in=None, h264_fps=None):
     if h264_in and os.path.exists(h264_in):
         rfps = _fmt_fps(h264_fps or _effective_hls_fps(fps))
-        # CHN1 raw VI bypasses the VPSS bMirror+bFlip rotation, so the
-        # encoded stream is upside down. Tag rotation in mp4 metadata so
-        # conformant players display it right-side-up without re-encoding.
+        # Rotation now applied at sensor level (GC4653 reg 0x0101 = 0x03)
+        # so CHN2 NV12 frames are already right-side-up. No mp4 metadata
+        # rotate tag needed; adding one would double-flip the playback.
         cmds = [
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
-             '-framerate', rfps, '-i', h264_in, '-c:v', 'copy',
-             '-metadata:s:v:0', 'rotate=180', out_mp4],
+             '-framerate', rfps, '-i', h264_in, '-c:v', 'copy', out_mp4],
             ['ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
              '-framerate', rfps, '-i', h264_in, '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p',
-             '-metadata:s:v:0', 'rotate=180', out_mp4],
+             out_mp4],
         ]
         for cmd in cmds:
             try:
@@ -1209,14 +1216,31 @@ def _start_yolo_inner():
         sh = int(cfg.get('sensor_height', 720))
         if (sw, sh) not in SENSOR_RES_OPTIONS:
             sw, sh = 1280, 720
-        # HLS encoder output. Defaults to sensor size if not configured or
-        # if the configured value exceeds the sensor (CHN0 is the source).
+        # Per-VPSS-chn dims + fps. CHN1 (HLS) and CHN2 (Record) are scaled
+        # by VPSS HW directly from sensor raw; they are independent of CHN0
+        # (and of each other). Clamp to sensor raw (2560x1440 on GC4653)
+        # and floor at 64 so the encoder doesn't reject the size.
+        SENSOR_MAX_W, SENSOR_MAX_H = 2560, 1440
         hw = int(cfg.get('hls_width')  or sw)
         hh = int(cfg.get('hls_height') or sh)
-        hw = max(64, min(hw, sw))
-        hh = max(64, min(hh, sh))
+        hw = max(64, min(hw, SENSOR_MAX_W))
+        hh = max(64, min(hh, SENSOR_MAX_H))
         env['YOLO_HLS_W'] = str(hw)
         env['YOLO_HLS_H'] = str(hh)
+        rw_cfg = int(cfg.get('record_width')  or sw)
+        rh_cfg = int(cfg.get('record_height') or sh)
+        rw_cfg = max(64, min(rw_cfg, SENSOR_MAX_W))
+        rh_cfg = max(64, min(rh_cfg, SENSOR_MAX_H))
+        env['YOLO_REC_W'] = str(rw_cfg)
+        env['YOLO_REC_H'] = str(rh_cfg)
+        tfps_cap = int(cfg.get('target_fps', 0) or 30)
+        hfps = int(cfg.get('hls_fps', 0) or 0)
+        if hfps > 0: env['YOLO_HLS_FPS'] = str(max(1, min(hfps, tfps_cap)))
+        rfps = int(cfg.get('record_fps', 0) or 0)
+        if rfps > 0: env['YOLO_REC_FPS'] = str(max(1, min(rfps, tfps_cap)))
+        # Rotation: VPSS HW mirror+flip on all three chns. Default ON
+        # because the GC4653 module is physically upside-down.
+        env['YOLO_ROTATE'] = '1' if cfg.get('rotation_180', True) else '0'
         # Build --zones "x,y;x,y;..." (clamped to frame). Empty list -> auto-
         # populate a single center zone and persist, so the UI yellow box
         # matches what stream_yolo actually crops.
@@ -1830,7 +1854,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   <div class="s-section">
     <h2>Camera</h2>
     <div class="s-row">
-      <span class="s-label">Resolution</span>
+      <span class="s-label">Capture (YOLO)</span>
       <select id="senRes" style="flex:1">
         <option value="1280,720">1280 x 720</option>
         <option value="1920,1080">1920 x 1080 (HD)</option>
@@ -1839,7 +1863,21 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
       <button onclick="rebootDevice()" style="margin-left:6px">Reboot</button>
     </div>
     <div class="s-row">
-      <span class="s-label">HLS stream</span>
+      <span class="s-label">Capture FPS</span>
+      <input type="range" id="fpsCap" min="0" max="30" step="1" value="10" style="flex:1"
+             oninput="document.getElementById('fpsv').textContent=this.value==0?'off':this.value">
+      <span id="fpsv" style="width:32px;text-align:right">10</span>
+    </div>
+    <div class="s-row">
+      <span class="s-label">Rotate 180</span>
+      <label style="flex:1"><input type="checkbox" id="rot180"> Sensor is mounted upside-down</label>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>HLS stream</h2>
+    <div class="s-row">
+      <span class="s-label">Resolution</span>
       <select id="hlsRes" style="flex:1">
         <option value="640,360">640 x 360</option>
         <option value="854,480">854 x 480</option>
@@ -1849,10 +1887,30 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
       </select>
     </div>
     <div class="s-row">
-      <span class="s-label">FPS cap</span>
-      <input type="range" id="fpsCap" min="0" max="30" step="1" value="15" style="flex:1"
-             oninput="document.getElementById('fpsv').textContent=this.value==0?'off':this.value">
-      <span id="fpsv" style="width:32px;text-align:right">15</span>
+      <span class="s-label">FPS</span>
+      <input type="range" id="hlsFps" min="1" max="30" step="1" value="5" style="flex:1"
+             oninput="document.getElementById('hlsFpsv').textContent=this.value">
+      <span id="hlsFpsv" style="width:32px;text-align:right">5</span>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Record</h2>
+    <div class="s-row">
+      <span class="s-label">Resolution</span>
+      <select id="recRes" style="flex:1">
+        <option value="640,360">640 x 360</option>
+        <option value="854,480">854 x 480</option>
+        <option value="1280,720">1280 x 720</option>
+        <option value="1920,1080">1920 x 1080</option>
+        <option value="2560,1440">2560 x 1440</option>
+      </select>
+    </div>
+    <div class="s-row">
+      <span class="s-label">FPS</span>
+      <input type="range" id="recFps" min="1" max="30" step="1" value="10" style="flex:1"
+             oninput="document.getElementById('recFpsv').textContent=this.value">
+      <span id="recFpsv" style="width:32px;text-align:right">10</span>
     </div>
   </div>
 
@@ -1959,16 +2017,29 @@ function loadConf(){
       if(!Array.isArray(cfg.detection_zones)) cfg.detection_zones=[];
       cfg.detection_zones.forEach(z=>{ if(!z.size) z.size=INFER_SZ; });
       cfg.active_detector = !!c.active_detector;
-      cfg.sensor_width = c.sensor_width||1280;
-      cfg.sensor_height= c.sensor_height||720;
+      cfg.sensor_width = c.sensor_width||1920;
+      cfg.sensor_height= c.sensor_height||1080;
       cfg.hls_width  = c.hls_width  || cfg.sensor_width;
       cfg.hls_height = c.hls_height || cfg.sensor_height;
+      cfg.hls_fps = (c.hls_fps==null)?5:c.hls_fps;
+      cfg.record_width  = c.record_width  || cfg.sensor_width;
+      cfg.record_height = c.record_height || cfg.sensor_height;
+      cfg.record_fps = (c.record_fps==null)?10:c.record_fps;
+      cfg.rotation_180 = (c.rotation_180==null)?true:!!c.rotation_180;
       const sr=document.getElementById('senRes');
       if(sr) sr.value=cfg.sensor_width+','+cfg.sensor_height;
       const hr=document.getElementById('hlsRes');
       if(hr) hr.value=cfg.hls_width+','+cfg.hls_height;
+      const hfps=document.getElementById('hlsFps');
+      if(hfps){hfps.value=cfg.hls_fps; document.getElementById('hlsFpsv').textContent=cfg.hls_fps;}
+      const rr=document.getElementById('recRes');
+      if(rr) rr.value=cfg.record_width+','+cfg.record_height;
+      const rfps=document.getElementById('recFps');
+      if(rfps){rfps.value=cfg.record_fps; document.getElementById('recFpsv').textContent=cfg.record_fps;}
+      const rot=document.getElementById('rot180');
+      if(rot) rot.checked=cfg.rotation_180;
       const fc=document.getElementById('fpsCap');
-      const tfps=(c.target_fps==null)?15:c.target_fps;
+      const tfps=(c.target_fps==null)?10:c.target_fps;
       if(fc){fc.value=tfps; document.getElementById('fpsv').textContent=tfps==0?'off':tfps;}
       renderDzList();
       renderZones(); renderClasses();
@@ -2464,6 +2535,18 @@ function applyAll(){
     cfg.hls_width =parseInt(hv[0]);
     cfg.hls_height=parseInt(hv[1]);
   }
+  const hf=document.getElementById('hlsFps');
+  if(hf) cfg.hls_fps=parseInt(hf.value);
+  const rr=document.getElementById('recRes');
+  if(rr){
+    const rv=rr.value.split(',');
+    cfg.record_width =parseInt(rv[0]);
+    cfg.record_height=parseInt(rv[1]);
+  }
+  const rf=document.getElementById('recFps');
+  if(rf) cfg.record_fps=parseInt(rf.value);
+  const rot=document.getElementById('rot180');
+  if(rot) cfg.rotation_180=!!rot.checked;
   const sw=cfg.sensor_width, sh=cfg.sensor_height;
   (cfg.detection_zones||[]).forEach(z=>{
     z.size=Math.max(INFER_SZ,z.size||INFER_SZ);  // minimum size only; zone may exceed frame

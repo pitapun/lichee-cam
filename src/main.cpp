@@ -885,11 +885,18 @@ int main(int argc, char *argv[]) {
     // more frames per second than the pipeline produced.
     int hls_fps = (target_fps > 0) ? std::min(target_fps, 5) : 5;
     int event_fps = target_fps > 0 ? target_fps : 25;
-    // HLS output size: env override (set by sidecar), default to disp size.
-    // Sidecar exposes this as a user-facing setting.
+    // HLS / Record output sizes: env overrides set by sidecar. VPSS CHN1
+    // (HLS) and CHN2 (Record) are configured to these dimensions via the
+    // same env vars by the opencv-mobile patch, so the VENC and the VPSS
+    // chn sizes always agree.
     int hls_w = disp_w, hls_h = disp_h;
     if (const char* env_w = getenv("YOLO_HLS_W")) { int v = atoi(env_w); if (v > 0) hls_w = v; }
     if (const char* env_h = getenv("YOLO_HLS_H")) { int v = atoi(env_h); if (v > 0) hls_h = v; }
+    int rec_w = disp_w, rec_h = disp_h;
+    if (const char* env_w = getenv("YOLO_REC_W")) { int v = atoi(env_w); if (v > 0) rec_w = v; }
+    if (const char* env_h = getenv("YOLO_REC_H")) { int v = atoi(env_h); if (v > 0) rec_h = v; }
+    if (const char* env_fps = getenv("YOLO_REC_FPS")) { int v = atoi(env_fps); if (v > 0) event_fps = v; }
+    if (const char* env_fps = getenv("YOLO_HLS_FPS")) { int v = atoi(env_fps); if (v > 0) hls_fps = v; }
     long last_mjpeg_ms = 0;
     const long MJPEG_FORCE_MS = ENABLE_HLS ? 2000 : 500;
     const char *HD_RECORD_CONTROL = "/tmp/ninti_hd_record_dir";
@@ -1034,20 +1041,12 @@ int main(int argc, char *argv[]) {
         }
     });
 
-    // Pre-init CHN1 (event recorder) before the main loop so the first event
-    // recording never stalls the loop with a 1-2s CVI_VENC_CreateChn call.
-    // Capture one raw frame to discover sensor dimensions, then release it.
-    int chn1_w = 0, chn1_h = 0;
-    {
-        VIDEO_FRAME_INFO_S* raw_f = (VIDEO_FRAME_INFO_S*)cap.captureRaw();
-        if (raw_f) {
-            VIDEO_FRAME_S& vf = raw_f->stVFrame;
-            chn1_w = (int)vf.u32Width;
-            chn1_h = (int)vf.u32Height;
-            cap.releaseImagePtr();  // release before CreateChn (avoids VI stall)
-            h264rec.init(chn1_w, chn1_h, event_fps);
-        }
-    }
+    // Pre-init the event-recorder VENC at the configured record dims so the
+    // first event never stalls the loop with a 1-2s CVI_VENC_CreateChn call.
+    // CHN1 raw VI is no longer the record source - VPSS CHN2 NV21 is - so
+    // there is no need to captureRaw to discover sensor dimensions.
+    int chn1_w = rec_w, chn1_h = rec_h;
+    h264rec.init(chn1_w, chn1_h, event_fps);
 
     // Start HLS VENC before the main loop so CreateChn never runs while a VI
     // frame is in-flight (which causes VI GetChnFrame to block permanently).
@@ -1136,8 +1135,14 @@ int main(int argc, char *argv[]) {
 
         cv::Mat frame;
         std::pair<void *, void *> imagePtrs = cap.capture(frame);
-        if (imagePtrs.first == nullptr) { interrupted = 1; break; }
+        if (frame.empty()) { interrupted = 1; break; }
+        // imagePtrs.first  = CHN1 NV21 (HLS) - may be null when CHN1's
+        //                    per-chn fps cap dropped this iter.
+        // imagePtrs.second = CHN2 NV21 (Record) - same caveat.
+        VIDEO_FRAME_INFO_S* hls_nv21 = (VIDEO_FRAME_INFO_S*)imagePtrs.first;
+        VIDEO_FRAME_INFO_S* rec_nv21 = (VIDEO_FRAME_INFO_S*)imagePtrs.second;
         VIDEO_FRAME_INFO_S* original_frame = (VIDEO_FRAME_INFO_S*)cap.getOriginalImagePtr();
+        (void)original_frame;
         long t1 = now_ms(); acc_cap += t1 - t0;
 
         // Deep-copy out of DMA buffer immediately; all downstream ops use cached heap memory.
@@ -1156,7 +1161,7 @@ int main(int argc, char *argv[]) {
             hd_record_dir = requested_hd_dir;
             hd_record_idx = 0;
             last_hd_record_ms = ts - HD_RECORD_INTERVAL_MS;
-            if (!hd_record_dir.empty() && original_frame && chn1_w > 0) {
+            if (!hd_record_dir.empty()) {
                 std::string h264_path = dirname_of(hd_record_dir) + "/event.h264";
                 h264rec.start(h264_path, chn1_w, chn1_h, event_fps);
                 fprintf(stderr, "[hdrec] start dir=%s h264=%s %dx%d\n",
@@ -1164,41 +1169,24 @@ int main(int argc, char *argv[]) {
             }
         }
         bool hd_recording = !hd_record_dir.empty();
-        // Feed the raw VI frame (sensor resolution, e.g. 2560x1440) to the
-        // CHN1 H264 encoder while the event is active. Must run before
-        // cap.releaseImagePtr() below, which releases original_frame.
-        if (hd_recording && original_frame) {
-            h264rec.send(original_frame);
+        // Feed the VPSS CHN2 NV21 frame to the record encoder while the
+        // event is active. CHN2 is rotated + sized to record resolution by
+        // the opencv-mobile patch, so this is a zero-copy hand-off. Must
+        // run before cap.releaseImagePtr() below, which returns the buffer
+        // slot to VPSS VbPool3.
+        if (hd_recording && rec_nv21) {
+            h264rec.send(rec_nv21);
         }
-        // Rate-limit HLS to its declared output rate. Previously this branch
-        // sent every loop iter, which over-fed VENC and made hlsrec.send()
-        // block in drain() for 600-2000ms — dragging the whole loop (and
-        // therefore event recording fps) down to ~1.
-        static long hls_last_ms = 0;
-        long hls_now = now_ms();
-        long hls_interval_ms = hls_fps > 0 ? 1000L / hls_fps : 200;
-        if (ENABLE_HLS && hlsrec.is_active() && !disp.empty()
-                && (hls_now - hls_last_ms) >= hls_interval_ms) {
-            hls_last_ms = hls_now;
-            long pr_t0 = now_ms();
-            // INTER_NEAREST: scalar INTER_LINEAR on c906 ate ~700ms per
-            // 1920x1080 -> 1280x720 resize, choking the loop down to ~1 fps.
-            // NEAREST is index-math + memcpy and runs in ~50ms; HLS at 5fps
-            // is a preview stream, the quality drop is invisible.
-            if (disp.cols != hlsrec.get_w() || disp.rows != hlsrec.get_h())
-                cv::resize(disp, hls_frame, cv::Size(hlsrec.get_w(), hlsrec.get_h()),
-                           0, 0, cv::INTER_NEAREST);
-            else
-                hls_frame = disp;
-            VIDEO_FRAME_INFO_S* nv21 = prepare_hls_frame(hls_frame);
-            static int pr_cnt = 0;
-            if (++pr_cnt <= 5 || pr_cnt % 100 == 0)
-                fprintf(stderr, "[diag] prepare_hls %ldms drain_req=%d\n", now_ms()-pr_t0, (int)hlsrec.is_drain_requested());
+        // HLS encode: read VPSS CHN1 NV21 frame produced at YOLO_HLS_FPS
+        // (rate-limited by VPSS HW). No more software BGR->NV21 conversion.
+        // getImagePtr() returns null when CHN1 has no frame this iter, which
+        // happens when CHN1 fps < capture fps.
+        if (ENABLE_HLS && hlsrec.is_active() && hls_nv21) {
             static int hls_call = 0;
             if (++hls_call <= 15 || hls_call % 50 == 0)
                 fprintf(stderr, "[hls] call send #%d nv21=%p venc=%d\n",
-                        hls_call, (void*)nv21, (int)hlsrec.is_venc_active());
-            if (nv21) hlsrec.send(nv21);
+                        hls_call, (void*)hls_nv21, (int)hlsrec.is_venc_active());
+            hlsrec.send(hls_nv21);
         }
         long t1b = now_ms();  // after HLS send
         acc_clone += t1a - t1; acc_hls_send += t1b - t1a;
