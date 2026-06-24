@@ -160,13 +160,15 @@ public:
     HlsStreamer() : active(false), chn(0), fd(-1), event_fp_(nullptr), event_bytes_(0),
                     stream_started(false),
                     idr_pending(false), venc_active(false),
-                    saved_w(0), saved_h(0), saved_fps(0), drain_requested_(false) {}
+                    saved_w(0), saved_h(0), saved_fps(0), drain_requested_(false),
+                    last_idr_request_ms_(0) {}
 
     bool start(int w, int h, int fps) {
         // Sanity floor — encoder rejects sub-multiples of 16.
         if (w < 64) w = 64;
         if (h < 64) h = 64;
         saved_w = w; saved_h = h; saved_fps = fps;
+        last_idr_request_ms_ = 0;
         sps_nalu.reserve(256);
         pps_nalu.reserve(256);
 
@@ -214,7 +216,14 @@ public:
         if (drain_requested_.load()) return;
         if (idr_pending.exchange(false)) {
             CVI_VENC_RequestIDR(chn, CVI_FALSE);
+            last_idr_request_ms_ = now_ms();
             fprintf(stderr, "[hls] IDR requested (resume)\n");
+        }
+        long idr_now = now_ms();
+        if (idr_now - last_idr_request_ms_ >= 2000) {
+            CVI_VENC_RequestIDR(chn, CVI_FALSE);
+            last_idr_request_ms_ = idr_now;
+            fprintf(stderr, "[hls] IDR requested (periodic)\n");
         }
         static int send_count = 0;
         long sf_t0 = now_ms();
@@ -501,6 +510,7 @@ private:
     std::deque<PrerollChunk> preroll_;
     std::mutex preroll_mtx_;
     int saved_w, saved_h, saved_fps;
+    long last_idr_request_ms_;
     std::thread drain_thr_;
     std::mutex drain_mtx_;
     std::condition_variable drain_cv_;

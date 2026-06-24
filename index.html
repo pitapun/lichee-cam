@@ -187,7 +187,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
     <canvas id="hlsCanvas" style="display:none;width:100%;height:100%;object-fit:contain"></canvas>
     <canvas id="overlay"></canvas>
     <div id="stream-btns">
-      <button onclick="setStream('hls')"   id="btnHls">HLS</button>
+      <button onclick="setStream('ws')"    id="btnWs">WS</button>
       <button onclick="setStream('mjpeg')" id="btnMjpeg">MJPEG</button>
     </div>
   </div>
@@ -419,7 +419,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   <span id="stRtsp"></span>
 </div>
 
-<script src="/hls.min.js"></script>
+<script src="/jmuxer.min.js"></script>
 <script>
 const PALETTE=['#f55','#5af','#5f5','#fa5','#a5f','#ff5','#5ff'];
 const INFER_SZ=640; const MAX_DET_ZONES=4;
@@ -441,8 +441,8 @@ let es=null;
 let pendingMode='ninti';
 let dzDrag=null;  // {idx,offX,offY} during detection-zone drag
 let eventPlaybackTimer=null;
-var _hlsObj=null;
-var _streamMode='mjpeg';
+var _wsLivePlayer=null;
+var _streamMode='ws';
 
 const streamEl=document.getElementById('stream');
 const cvs=document.getElementById('overlay');
@@ -462,7 +462,7 @@ function connect(){
   openWS();
   pollStatus();
   setInterval(loadEvents, 5000);
-  setStream('hls');
+  setStream('ws');
 }
 
 function loadConf(){
@@ -915,7 +915,7 @@ function onDiscard(d){
 // Canvas
 function syncCvs(){
   const hlsEl=document.getElementById('hlsPlayer');
-  const activeEl=(_streamMode==='hls'&&hlsEl.videoWidth)?hlsEl:streamEl;
+  const activeEl=(_streamMode==='ws'&&hlsEl.videoWidth)?hlsEl:streamEl;
   const lr=activeEl.getBoundingClientRect();
   const pr=activeEl.parentElement.getBoundingClientRect();
   const nw=(activeEl===hlsEl?hlsEl.videoWidth:activeEl.naturalWidth)||640;
@@ -1287,106 +1287,128 @@ function showMainTab(name, btn){
     requestAnimationFrame(syncCvs);
   }
   if(name==='events') loadEvents();
-  // leaving video tabs: tear down HLS so buffer doesn't accumulate
-  if(wasVideoTab && !isVideoTab && _streamMode==='hls') {
-    if(_hlsObj){ _hlsObj.destroy(); _hlsObj=null; }
-    const hlsEl=document.getElementById('hlsPlayer');
-    hlsEl.pause(); hlsEl.src='';
+  // leaving video tabs: tear down live video so buffers don't accumulate
+  if(wasVideoTab && !isVideoTab && _streamMode==='ws') {
+    stopWsLive();
   }
-  // returning to a video tab: restart HLS fresh from live edge
-  if(!wasVideoTab && isVideoTab && _streamMode==='hls') {
-    setStream('hls');
+  // returning to a video tab: restart WebSocket fresh from live edge
+  if(!wasVideoTab && isVideoTab && _streamMode==='ws') {
+    setStream('ws');
   }
 }
 
-if(document.getElementById('ip').value) connect();
+function stopWsLive(){
+  if(_wsLivePlayer){ _wsLivePlayer.destroy(); _wsLivePlayer=null; }
+  const v=document.getElementById('hlsPlayer');
+  v.pause();
+  v.removeAttribute('src');
+  v.load();
+}
 
-let _hlsWatchdogTimer = null;
-let _hlsLastTime = 0;
-let _hlsStallCount = 0;
-function _armHlsWatchdog(){
-  if (_hlsWatchdogTimer) { clearInterval(_hlsWatchdogTimer); _hlsWatchdogTimer = null; }
-  _hlsLastTime = 0; _hlsStallCount = 0;
-  _hlsWatchdogTimer = setInterval(() => {
-    if (_streamMode !== 'hls') return;
-    const v = document.getElementById('hlsPlayer');
-    if (!v || v.paused || document.hidden) return;
-    if (v.currentTime === _hlsLastTime) {
-      _hlsStallCount++;
-      if (_hlsStallCount >= 2) {
-        _hlsStallCount = 0;
-        try {
-          const b = v.buffered;
-          if (b.length && b.end(b.length-1) - v.currentTime > 1) {
-            v.currentTime = b.end(b.length-1) - 0.5;
-            v.play().catch(()=>{});
-            return;
-          }
-        } catch(_) {}
-        setStream('hls');
-      }
-    } else {
-      _hlsStallCount = 0;
-      _hlsLastTime = v.currentTime;
+function parseWsfsFrame(buf){
+  if(!buf || buf.byteLength < 64) return null;
+  const u8=new Uint8Array(buf);
+  if(u8[0]!==0x57 || u8[1]!==0x53 || u8[2]!==0x46 || u8[3]!==0x53) return null;
+  const dv=new DataView(buf);
+  const headerLen=dv.getUint16(6,false) || 64;
+  const payloadLen=dv.getUint32(16,false);
+  const tsHi=dv.getUint32(8,false);
+  const tsLo=dv.getUint32(12,false);
+  const tsUs=tsHi*4294967296+tsLo;
+  if(headerLen < 64 || headerLen > buf.byteLength) return null;
+  const end=payloadLen ? Math.min(buf.byteLength, headerLen+payloadLen) : buf.byteLength;
+  return {payload:new Uint8Array(buf,headerLen,end-headerLen), tsUs};
+}
+
+class WsfsLivePlayer{
+  constructor(video, url, fps){
+    this.video=video;
+    this.url=url;
+    this.fps=Math.max(1, fps||5);
+    this.ws=null;
+    this.jmuxer=null;
+    this.rxFrames=0;
+    this.fedGroups=0;
+    this.lastError='';
+    this.lastTsUs=0;
+    this.stopped=false;
+    this.retry=null;
+  }
+  start(){
+    this.destroy(false);
+    this.stopped=false;
+    this.video.style.display='block';
+    this.jmuxer=new JMuxer({
+      node:this.video,
+      mode:'video',
+      flushingTime:0,
+      fps:this.fps,
+      clearBuffer:true,
+      maxDelay:500,
+      debug:false,
+      onError:(e)=>{this.lastError='JMuxer: '+e;setStatus(this.lastError);}
+    });
+    this.ws=new WebSocket(this.url);
+    this.ws.binaryType='arraybuffer';
+    this.ws.onopen=()=>setStatus('WebSocket live connected');
+    this.ws.onmessage=(e)=>this.onFrame(e.data);
+    this.ws.onerror=()=>{try{this.ws.close();}catch(_){}};
+    this.ws.onclose=()=>{if(!this.stopped)this.retry=setTimeout(()=>this.start(),1500);};
+  }
+  onFrame(data){
+    const frame=parseWsfsFrame(data);
+    if(!frame || !frame.payload || frame.payload.byteLength===0 || !this.jmuxer)return;
+    let duration=1000/this.fps;
+    if(this.lastTsUs && frame.tsUs > this.lastTsUs){
+      duration=Math.max(20,Math.min(1000,(frame.tsUs-this.lastTsUs)/1000));
     }
-  }, 5000);
+    this.lastTsUs=frame.tsUs;
+    this.rxFrames++;
+    this.fedGroups++;
+    try{
+      this.jmuxer.feed({video:frame.payload,duration});
+    }catch(e){
+      this.lastError='JMuxer feed: '+e;
+      setStatus(this.lastError);
+    }
+    if(this.video.paused)this.video.play().catch(()=>{});
+    requestAnimationFrame(syncCvs);
+  }
+  destroy(markStopped=true){
+    if(markStopped)this.stopped=true;
+    if(this.retry){clearTimeout(this.retry);this.retry=null;}
+    if(this.ws){try{this.ws.close();}catch(_){} this.ws=null;}
+    if(this.jmuxer){try{this.jmuxer.destroy();}catch(_){} this.jmuxer=null;}
+    this.lastTsUs=0;
+  }
 }
+
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
-  if (_streamMode !== 'hls') return;
-  const v = document.getElementById('hlsPlayer');
-  if (!v) return;
-  try {
-    const b = v.buffered;
-    if (b.length && b.end(b.length-1) - v.currentTime > 3) {
-      v.currentTime = b.end(b.length-1) - 0.5;
-    }
-    v.play().catch(()=>{ setStream('hls'); });
-  } catch(_) { setStream('hls'); }
+  if (_streamMode === 'ws') setStream('ws');
 });
 
-// ---- HLS player (rotation handled by VPSS hardware: bMirror+bFlip in capture_cvi.cpp) ----
+// ---- Live stream player (WSFS H264 by default, MJPEG fallback) ----
 function setStream(mode) {
   const ip      = document.getElementById('ip').value.trim();
   const mjpegEl = document.getElementById('stream');
-  const hlsEl   = document.getElementById('hlsPlayer');
+  const videoEl = document.getElementById('hlsPlayer');
   _streamMode = mode;
-  if (mode === 'hls') {
+  if (mode === 'ws') {
     mjpegEl.src = ''; mjpegEl.style.display = 'none';
-    hlsEl.style.display = 'block';
-    const hlsUrl = 'http://' + ip + ':7778/hls/live.m3u8';
-    if (window.Hls && Hls.isSupported()) {
-      if (_hlsObj) _hlsObj.destroy();
-      _hlsObj = new Hls({
-        liveSyncDurationCount: 3,
-        liveMaxLatencyDurationCount: 6,
-        maxBufferLength: 20,
-        maxMaxBufferLength: 20,
-        lowLatencyMode: false,
-      });
-      _hlsObj.loadSource(hlsUrl);
-      _hlsObj.attachMedia(hlsEl);
-      _hlsObj.on(Hls.Events.MANIFEST_PARSED, () => hlsEl.play().catch(()=>{}));
-      _hlsObj.on(Hls.Events.ERROR, (_e, data) => {
-        if (!data || !data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          try { _hlsObj.startLoad(); return; } catch(_) {}
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          try { _hlsObj.recoverMediaError(); return; } catch(_) {}
-        }
-        setTimeout(() => { if (_streamMode === 'hls') setStream('hls'); }, 500);
-      });
-    } else if (hlsEl.canPlayType('application/vnd.apple.mpegurl')) {
-      hlsEl.src = hlsUrl; hlsEl.play().catch(()=>{});
-    }
-    _armHlsWatchdog();
+    videoEl.style.display = 'block';
+    stopWsLive();
+    const wsUrl = 'ws://' + ip + ':7778/ws/live';
+    _wsLivePlayer = new WsfsLivePlayer(videoEl, wsUrl, cfg.hls_fps || 5);
+    _wsLivePlayer.start();
   } else {
-    if (_hlsObj) { _hlsObj.destroy(); _hlsObj = null; }
-    hlsEl.src = ''; hlsEl.style.display = 'none';
+    stopWsLive();
+    videoEl.style.display = 'none';
     mjpegEl.style.display = '';
     mjpegEl.src = 'http://' + ip + ':7778/stream';
   }
 }
+if(document.getElementById('ip').value) connect();
 </script>
 </body>
 </html>

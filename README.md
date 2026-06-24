@@ -37,7 +37,7 @@ Everything needed on the device. Deploy all of these on a fresh install.
 IP=192.168.1.121   # or ProxyJump: ssh -o ProxyJump=pi5-4g root@192.168.100.195
 
 # Core files
-scp sidecar.py index.html hls.min.js root@$IP:/root/
+scp sidecar.py index.html hls.min.js jmuxer.min.js root@$IP:/root/
 
 # Init script
 scp S98ninti_sidecar root@$IP:/etc/init.d/S98ninti_sidecar
@@ -88,14 +88,21 @@ ssh root@$IP 'mv /root/stream_yolo.new /root/stream_yolo && reboot'
 
 ```bash
 scp bin/stream_yolo root@$IP:/root/stream_yolo.new
-scp sidecar.py index.html hls.min.js root@$IP:/root/
+scp sidecar.py index.html hls.min.js jmuxer.min.js root@$IP:/root/
 ssh root@$IP 'mv /root/stream_yolo.new /root/stream_yolo && reboot'
 ```
 
 Wait ~50s after reboot, then verify:
 
 ```bash
-ssh root@$IP 'ls /tmp/hls/*.ts 2>/dev/null | wc -l'   # expect >= 3
+ssh root@$IP 'python3 - <<'"'"'PY'"'"'
+import base64, os, socket
+key = base64.b64encode(os.urandom(16)).decode()
+s = socket.create_connection(("127.0.0.1", 7778), 5)
+s.sendall((f"GET /ws/live HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+print(s.recv(128).decode("latin1", "ignore").split("\r\n")[0])
+s.close()
+PY' # expect HTTP/1.1 101 Switching Protocols
 curl -s -o /dev/null -w "%{http_code}" http://$IP:7778/ # expect 200
 ```
 
@@ -169,4 +176,4 @@ Key constraints:
 
 - Sidecar restart without reboot leaves stream_yolo in VENC `EnterVcodecLock` D-state. Always reboot after sidecar.py changes.
 - `CVI_VPSS_CreateGrp failed`: VPSS not released after forced kill. Reboot to recover.
-- HLS takes ~45s after reboot before first segments appear (camera init + VENC warm-up).
+- WS live takes ~45s after reboot before first decodable H264 frames appear (camera init + VENC warm-up).

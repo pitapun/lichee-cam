@@ -8,7 +8,7 @@ NintiDetect sidecar
   - Serves web UI on port 7778  (MJPEG still direct from :7777)
 """
 
-import json, os, shutil, subprocess, threading, time, socket, sys, io, collections
+import json, os, shutil, subprocess, threading, time, socket, sys, io, collections, select
 import hashlib, base64
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -111,14 +111,21 @@ _pre_buf_lock = threading.Lock()
 _ws_clients = []          # list of Queue objects
 _ws_clients_lock = threading.Lock()
 _ws_state = {}            # latest status fields from stream_yolo (_status UDP msgs)
+_ws_live_clients = []     # list of Queue objects for binary WSFS H264
+_ws_live_clients_lock = threading.Lock()
+_ws_live_stop = threading.Event()
+_ws_live_thread = None
+_ws_live_seq = 0
+_ws_live_codec_header = b''
+_ws_live_codec_header_lock = threading.Lock()
 
 
-def _ws_frame(data):
-    """Encode payload as a WebSocket text frame (opcode=0x1, FIN set)."""
+def _ws_frame(data, opcode=0x1):
+    """Encode payload as an unmasked server WebSocket frame."""
     if isinstance(data, str):
         data = data.encode('utf-8')
     length = len(data)
-    hdr = bytearray([0x81])
+    hdr = bytearray([0x80 | (opcode & 0x0f)])
     if length < 126:
         hdr.append(length)
     elif length < 65536:
@@ -143,6 +150,138 @@ def _ws_broadcast(msg):
                 dead.append(q)
         for q in dead:
             try: _ws_clients.remove(q)
+            except ValueError: pass
+
+
+def _ws_live_client_count():
+    with _ws_live_clients_lock:
+        return len(_ws_live_clients)
+
+
+def _ws_live_make_packet(payload, keyframe=False):
+    global _ws_live_seq
+    with config_lock:
+        width = int(cfg.get('hls_width') or cfg.get('sensor_width') or 0)
+        height = int(cfg.get('hls_height') or cfg.get('sensor_height') or 0)
+    _ws_live_seq = (_ws_live_seq + 1) & 0xffffffff
+    ts_us = int(time.time() * 1000000)
+    header = bytearray(64)
+    header[0:4] = b'WSFS'
+    header[4] = 1                    # version
+    header[5] = 1 if keyframe else 2  # H264 key/delta
+    header[6:8] = (64).to_bytes(2, 'big')
+    header[8:16] = ts_us.to_bytes(8, 'big')
+    header[16:20] = len(payload).to_bytes(4, 'big')
+    header[20:24] = _ws_live_seq.to_bytes(4, 'big')
+    header[24:28] = max(0, width).to_bytes(4, 'big')
+    header[28:32] = max(0, height).to_bytes(4, 'big')
+    header[32:36] = (1).to_bytes(4, 'big')  # codec: H264
+    return _ws_frame(bytes(header) + payload, opcode=0x2)
+
+
+def _h264_has_idr(buf):
+    i = 0
+    n = len(buf)
+    while i + 5 < n:
+        if buf[i:i+4] == b'\x00\x00\x00\x01':
+            nal_i = i + 4
+            i = nal_i + 1
+        elif buf[i:i+3] == b'\x00\x00\x01':
+            nal_i = i + 3
+            i = nal_i + 1
+        else:
+            i += 1
+            continue
+        if nal_i < n and (buf[nal_i] & 0x1f) == 5:
+            return True
+    return False
+
+
+def _h264_nal_ranges(buf):
+    starts = _h264_start_codes(buf)
+    out = []
+    for idx, start in enumerate(starts):
+        if buf[start:start+4] == b'\x00\x00\x00\x01':
+            nal_i = start + 4
+        else:
+            nal_i = start + 3
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(buf)
+        if nal_i < end:
+            out.append((buf[nal_i] & 0x1f, start, end))
+    return out
+
+
+def _h264_update_codec_header(buf):
+    global _ws_live_codec_header
+    ranges = _h264_nal_ranges(buf)
+    header_parts = [bytes(buf[start:end]) for typ, start, end in ranges if typ in (7, 8)]
+    if header_parts:
+        with _ws_live_codec_header_lock:
+            _ws_live_codec_header = b''.join(header_parts)
+
+
+def _h264_with_header_if_needed(buf):
+    ranges = _h264_nal_ranges(buf)
+    has_idr = any(typ == 5 for typ, _, _ in ranges)
+    has_header = any(typ in (7, 8) for typ, _, _ in ranges)
+    if not has_idr or has_header:
+        return buf
+    with _ws_live_codec_header_lock:
+        header = _ws_live_codec_header
+    return header + buf if header else buf
+
+
+def _h264_start_codes(buf):
+    starts = []
+    i = 0
+    n = len(buf)
+    while i + 3 < n:
+        if buf[i:i+4] == b'\x00\x00\x00\x01':
+            starts.append(i)
+            i += 4
+        elif buf[i:i+3] == b'\x00\x00\x01':
+            starts.append(i)
+            i += 3
+        else:
+            i += 1
+    return starts
+
+
+def _h264_pop_complete(buf):
+    starts = _h264_start_codes(buf)
+    if len(starts) < 2:
+        return None
+    cut = starts[-1]
+    if cut <= 0:
+        return None
+    payload = bytes(buf[:cut])
+    del buf[:cut]
+    return payload
+
+
+def _ws_live_broadcast(payload):
+    if not payload:
+        return
+    if _ws_live_client_count() <= 0:
+        return
+    frame = _ws_live_make_packet(payload, False)
+    with _ws_live_clients_lock:
+        dead = []
+        for q in _ws_live_clients:
+            try:
+                q.put_nowait(frame)
+            except Exception:
+                try:
+                    while True:
+                        q.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    q.put_nowait(frame)
+                except Exception:
+                    dead.append(q)
+        for q in dead:
+            try: _ws_live_clients.remove(q)
             except ValueError: pass
 
 
@@ -1132,53 +1271,74 @@ def _stop_rtsp():
     time.sleep(1)
     print('[rtsp] stopped')
 
-# ---- HLS ffmpeg lifecycle ----
+# ---- WebSocket live H264 lifecycle ----
 HLS_FIFO = '/tmp/hls_feed.h264'
 HLS_DIR  = '/tmp/hls'
-HLS_ENABLED = True
-_hls_proc = None
+LIVE_WS_ENABLED = True
 _hls_lock = threading.Lock()
 
-def _start_hls_ffmpeg():
-    global _hls_proc
-    if not HLS_ENABLED:
-        return
-    hls_fps = _effective_hls_fps()
-    os.makedirs(HLS_DIR, exist_ok=True)
-    if not os.path.exists(HLS_FIFO):
-        os.mkfifo(HLS_FIFO)
-    time.sleep(1)
-    with _hls_lock:
-        if _hls_proc and _hls_proc.poll() is None:
-            _hls_proc.terminate()
-            try: _hls_proc.wait(3)
-            except: _hls_proc.kill()
-        _hls_proc = subprocess.Popen([
-            'ffmpeg', '-y', '-loglevel', 'error',
-            '-use_wallclock_as_timestamps', '1',
-            '-fflags', '+genpts',
-            '-f', 'h264', '-r', str(hls_fps), '-i', HLS_FIFO,
-            '-c:v', 'copy',
-            '-f', 'hls',
-            '-hls_time', '2',
-            '-hls_list_size', '5',
-            '-hls_flags', 'delete_segments+append_list+omit_endlist+split_by_time',
-            f'{HLS_DIR}/live.m3u8',
-        ], stdout=subprocess.DEVNULL, stderr=open('/tmp/hls_ffmpeg.log', 'w'))
-        print(f'[hls] ffmpeg started pid={_hls_proc.pid}')
-
-def _stop_hls_ffmpeg():
-    global _hls_proc
-    with _hls_lock:
-        if _hls_proc:
-            _hls_proc.terminate()
-            try: _hls_proc.wait(5)
-            except: _hls_proc.kill()
-            _hls_proc = None
+def _clear_hls_dir():
     for f in os.listdir(HLS_DIR) if os.path.isdir(HLS_DIR) else []:
         try: os.remove(os.path.join(HLS_DIR, f))
         except: pass
-    print('[hls] ffmpeg stopped')
+
+def _start_live_ws_stream():
+    global _ws_live_thread
+    if not LIVE_WS_ENABLED:
+        return
+    os.makedirs(HLS_DIR, exist_ok=True)
+    if not os.path.exists(HLS_FIFO):
+        os.mkfifo(HLS_FIFO)
+    with _hls_lock:
+        _ws_live_stop.set()
+        if _ws_live_thread and _ws_live_thread.is_alive():
+            _ws_live_thread.join(timeout=2)
+        _ws_live_stop.clear()
+        _clear_hls_dir()
+        _ws_live_thread = threading.Thread(target=_live_ws_reader_loop, daemon=True)
+        _ws_live_thread.start()
+        print('[wslive] H264 FIFO reader started')
+
+def _stop_live_ws_stream():
+    with _hls_lock:
+        _ws_live_stop.set()
+        _clear_hls_dir()
+    print('[wslive] H264 FIFO reader stopped')
+
+def _live_ws_reader_loop():
+    fd = None
+    try:
+        while not _ws_live_stop.is_set():
+            try:
+                if fd is None:
+                    if not os.path.exists(HLS_FIFO):
+                        os.mkfifo(HLS_FIFO)
+                    fd = os.open(HLS_FIFO, os.O_RDONLY | os.O_NONBLOCK)
+                r, _, _ = select.select([fd], [], [], 0.5)
+                if not r:
+                    continue
+                while True:
+                    try:
+                        chunk = os.read(fd, 262144)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    _ws_live_broadcast(chunk)
+            except OSError as e:
+                print(f'[wslive] reader error: {e}')
+                if fd is not None:
+                    try: os.close(fd)
+                    except Exception: pass
+                    fd = None
+                time.sleep(0.5)
+            except Exception as e:
+                print(f'[wslive] reader exception: {e}')
+                time.sleep(0.5)
+    finally:
+        if fd is not None:
+            try: os.close(fd)
+            except Exception: pass
 
 # ---- stream_yolo lifecycle ----
 def _yolo_running():
@@ -1275,20 +1435,20 @@ def _start_yolo_inner():
         print(f'[yolo] starting threshold={thresh} sensor={sw}x{sh} '
               f'zones={clamped} active={cfg.get("active_detector",False)} '
               f'fps_cap={tfps or "off"}')
-        _stop_hls_ffmpeg()
+        _stop_live_ws_stream()
         yolo_log = open('/tmp/stream_yolo.log', 'a')
         yolo_log.write(f'\n[yolo] exec start ts={time.strftime("%Y-%m-%d %H:%M:%S")}\n')
         yolo_log.flush()
         yolo_proc = subprocess.Popen(args, env=env, stdout=yolo_log, stderr=yolo_log)
-        if HLS_ENABLED:
-            threading.Thread(target=_start_hls_ffmpeg, daemon=True).start()
+        if LIVE_WS_ENABLED:
+            threading.Thread(target=_start_live_ws_stream, daemon=True).start()
 
 def start_yolo():
     threading.Thread(target=_start_yolo_inner, daemon=True).start()
 
 def stop_yolo():
     global yolo_proc
-    _stop_hls_ffmpeg()
+    _stop_live_ws_stream()
     with yolo_lock:
         if yolo_proc:
             yolo_proc.terminate()
@@ -2849,6 +3009,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self._cors()
             self.end_headers()
+        elif path in ('/hls.min.js', '/jmuxer.min.js'):
+            js_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path.lstrip('/'))
+            if not os.path.exists(js_path):
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/javascript')
+            self.send_header('Content-Length', os.path.getsize(js_path))
+            self.send_header('Cache-Control', 'public, max-age=86400')
+            self._cors()
+            self.end_headers()
         elif path.startswith('/hls/'):
             rel = path[len('/hls/'):]
             rel = os.path.normpath(rel).lstrip('/')
@@ -2941,11 +3111,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith('/event-video/'):
             self._serve_event_file(path)
 
-        elif path == '/hls.min.js':
-            hls_js = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hls.min.js')
-            if not os.path.exists(hls_js):
+        elif path in ('/hls.min.js', '/jmuxer.min.js'):
+            js_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path.lstrip('/'))
+            if not os.path.exists(js_path):
                 self.send_response(404); self.end_headers(); return
-            data = open(hls_js, 'rb').read()
+            data = open(js_path, 'rb').read()
             self.send_response(200)
             self.send_header('Content-Type', 'application/javascript')
             self.send_header('Content-Length', len(data))
@@ -3029,6 +3199,9 @@ class Handler(BaseHTTPRequestHandler):
                 try: sse_clients.remove(q)
                 except ValueError: pass
 
+        elif path == '/ws/live':
+            self._handle_live_ws()
+
         elif path == '/ws':
             self._handle_ws()
 
@@ -3067,6 +3240,45 @@ class Handler(BaseHTTPRequestHandler):
             with _ws_clients_lock:
                 try: _ws_clients.remove(q)
                 except ValueError: pass
+
+    def _handle_live_ws(self):
+        key = self.headers.get('Sec-WebSocket-Key', '')
+        if not key or self.headers.get('Upgrade', '').lower() != 'websocket':
+            self.send_response(400); self.end_headers(); return
+        accept = base64.b64encode(
+            hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()
+        ).decode()
+        resp = (
+            'HTTP/1.1 101 Switching Protocols\r\n'
+            'Upgrade: websocket\r\n'
+            'Connection: Upgrade\r\n'
+            f'Sec-WebSocket-Accept: {accept}\r\n'
+            '\r\n'
+        )
+        self.connection.sendall(resp.encode())
+        q = Queue(maxsize=8)
+        with _ws_live_clients_lock:
+            _ws_live_clients.append(q)
+        with _ws_live_codec_header_lock:
+            header = _ws_live_codec_header
+        if header:
+            try: q.put_nowait(_ws_live_make_packet(header, keyframe=True))
+            except Exception: pass
+        print(f'[wslive] client connected n={_ws_live_client_count()}')
+        try:
+            while True:
+                try:
+                    frame = q.get(timeout=30)
+                    self.connection.sendall(frame)
+                except Empty:
+                    self.connection.sendall(bytes([0x89, 0x00]))  # ping
+        except Exception:
+            pass
+        finally:
+            with _ws_live_clients_lock:
+                try: _ws_live_clients.remove(q)
+                except ValueError: pass
+            print(f'[wslive] client disconnected n={_ws_live_client_count()}')
 
     def do_POST(self):
         path = urlparse(self.path).path
