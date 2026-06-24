@@ -78,7 +78,21 @@ DEFAULT_CONFIG = {
 }
 INFER_SIZE = 640
 MAX_ZONES  = 4
-SENSOR_RES_OPTIONS = [(1280, 720), (1920, 1080), (2560, 1440)]
+SENSOR_RES_OPTIONS = [(1920, 1080), (2560, 1440)]
+
+def normalize_camera_resolution(values, *, force=False):
+    if not force and 'sensor_width' not in values and 'sensor_height' not in values:
+        return None
+    try:
+        sw = int(values.get('sensor_width', DEFAULT_CONFIG['sensor_width']))
+        sh = int(values.get('sensor_height', DEFAULT_CONFIG['sensor_height']))
+    except Exception:
+        sw, sh = DEFAULT_CONFIG['sensor_width'], DEFAULT_CONFIG['sensor_height']
+    if (sw, sh) not in SENSOR_RES_OPTIONS:
+        sw, sh = DEFAULT_CONFIG['sensor_width'], DEFAULT_CONFIG['sensor_height']
+    values['sensor_width'] = sw
+    values['sensor_height'] = sh
+    return sw, sh
 
 # ---- State ----
 config_lock  = threading.Lock()
@@ -1372,10 +1386,7 @@ def _start_yolo_inner():
         if cfg.get('sensor_driver'):
             env['YOLO_SNS'] = str(cfg['sensor_driver'])
         thresh = str(cfg.get('threshold', 0.45))
-        sw = int(cfg.get('sensor_width',  1280))
-        sh = int(cfg.get('sensor_height', 720))
-        if (sw, sh) not in SENSOR_RES_OPTIONS:
-            sw, sh = 1280, 720
+        sw, sh = normalize_camera_resolution(cfg, force=True)
         # Per-VPSS-chn dims + fps. CHN1 (HLS) and CHN2 (Record) are scaled
         # by VPSS HW directly from sensor raw; they are independent of CHN0
         # (and of each other). Clamp to sensor raw (2560x1440 on GC4653)
@@ -3292,6 +3303,7 @@ class Handler(BaseHTTPRequestHandler):
                 new.pop('mqtt_has_password', None)
                 if new.get('mqtt_password', None) == '':
                     new.pop('mqtt_password', None)
+                normalize_camera_resolution(new)
                 with config_lock:
                     cfg.update(new)
                 save_cfg()

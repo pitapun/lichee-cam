@@ -314,7 +314,6 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
     <div class="s-row">
       <span class="s-label">Resolution</span>
       <select id="senRes" style="flex:1">
-        <option value="1280,720">1280 x 720</option>
         <option value="1920,1080">1920 x 1080 (HD)</option>
         <option value="2560,1440">2560 x 1440 (QHD)</option>
       </select>
@@ -430,7 +429,7 @@ let liveActiveZoneTs=0;
 // (i.e. once the new value has been sent to stream_yolo).
 let dzCfgDirty=false;
 let cfg={mode:'ninti',threshold:0.45,zones:[],filter_classes:['person','vehicle','animal'],
-         detection_zones:[],active_detector:false,sensor_width:1280,sensor_height:720,
+         detection_zones:[],active_detector:false,sensor_width:1920,sensor_height:1080,
          mqtt_enabled:false,mqtt_host:'',mqtt_port:1883,mqtt_username:'',
          mqtt_base_topic:'nintidetect/195',mqtt_device_name:'NintiDetect 195'};
 let drawing=null;
@@ -481,8 +480,12 @@ function loadConf(){
       if(!Array.isArray(cfg.detection_zones)) cfg.detection_zones=[];
       cfg.detection_zones.forEach(z=>{ if(!z.size) z.size=INFER_SZ; });
       cfg.active_detector = !!c.active_detector;
-      cfg.sensor_width = c.sensor_width||1280;
-      cfg.sensor_height= c.sensor_height||720;
+      cfg.sensor_width = c.sensor_width||1920;
+      cfg.sensor_height= c.sensor_height||1080;
+      if(cfg.sensor_width===1280 && cfg.sensor_height===720){
+        cfg.sensor_width=1920;
+        cfg.sensor_height=1080;
+      }
       cfg.hls_width    = c.hls_width    || cfg.sensor_width;
       cfg.hls_height   = c.hls_height   || cfg.sensor_height;
       cfg.hls_fps      = (c.hls_fps==null)?5:c.hls_fps;
