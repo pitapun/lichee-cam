@@ -214,7 +214,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
       <button id="activeBtn" onclick="toggleActiveDetector()" style="width:100%">Zone 1 follower: OFF</button>
       <div class="hint" style="font-size:10px;color:#555;margin-top:2px">Follows detected target when ON</div>
       <div id="dzlist" class="hint"></div>
-      <button onclick="applyAll()" class="act apply-all-btn" style="width:100%">Apply</button>
+      <button onclick="applyAll()" class="act apply-all-btn" data-label="Apply" style="width:100%">Apply</button>
     </div>
     <div class="zp-section">
       <div class="panel-head">Filter Zones</div>
@@ -318,7 +318,6 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
         <option value="1920,1080">1920 x 1080 (HD)</option>
         <option value="2560,1440">2560 x 1440 (QHD)</option>
       </select>
-      <button onclick="rebootDevice()" style="margin-left:6px">Reboot</button>
     </div>
     <div class="s-row">
       <span class="s-label">FPS cap</span>
@@ -326,7 +325,55 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
              oninput="document.getElementById('fpsv').textContent=this.value==0?'off':this.value">
       <span id="fpsv" style="width:32px;text-align:right">15</span>
     </div>
+    <div class="s-row">
+      <span class="s-label">Rotate 180</span>
+      <label style="flex:1"><input type="checkbox" id="rot180"> Sensor is mounted upside-down</label>
+    </div>
   </div>
+
+  <div class="s-section">
+    <h2>HLS stream</h2>
+    <div class="s-row">
+      <span class="s-label">Resolution</span>
+      <select id="hlsRes" style="flex:1">
+        <option value="640,360">640 x 360</option>
+        <option value="854,480">854 x 480</option>
+        <option value="1280,720">1280 x 720</option>
+        <option value="1920,1080">1920 x 1080</option>
+        <option value="2560,1440">2560 x 1440</option>
+      </select>
+    </div>
+    <div class="s-row">
+      <span class="s-label">FPS</span>
+      <input type="range" id="hlsFps" min="1" max="30" step="1" value="5" style="flex:1"
+             oninput="document.getElementById('hlsFpsv').textContent=this.value">
+      <span id="hlsFpsv" style="width:32px;text-align:right">5</span>
+    </div>
+  </div>
+
+  <div class="s-section">
+    <h2>Record</h2>
+    <div class="s-row">
+      <span class="s-label">Resolution</span>
+      <select id="recRes" style="flex:1">
+        <option value="640,360">640 x 360</option>
+        <option value="854,480">854 x 480</option>
+        <option value="1280,720">1280 x 720</option>
+        <option value="1920,1080">1920 x 1080</option>
+        <option value="2560,1440">2560 x 1440</option>
+      </select>
+    </div>
+    <div class="s-row">
+      <span class="s-label">FPS</span>
+      <input type="range" id="recFps" min="1" max="30" step="1" value="10" style="flex:1"
+             oninput="document.getElementById('recFpsv').textContent=this.value">
+      <span id="recFpsv" style="width:32px;text-align:right">10</span>
+    </div>
+  </div>
+
+  <button onclick="applyAll({reboot:true})" class="act apply-all-btn" data-label="Apply &amp; Reboot"
+          style="width:100%;padding:10px;font-size:13px;margin-top:4px;background:#3a2a2a;border-color:#6a4040">Apply &amp; Reboot</button>
+  <div class="hint" style="font-size:10px;color:#666;text-align:center;margin:2px 0 12px">Camera / HLS / Record changes require reboot</div>
 
   <div class="s-section">
     <h2>Threshold</h2>
@@ -360,7 +407,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
     <div id="log"></div>
   </div>
 
-  <button onclick="applyAll()" class="act apply-all-btn" style="width:100%;padding:10px;font-size:13px;margin-top:8px">Apply</button>
+  <button onclick="applyAll()" class="act apply-all-btn" data-label="Apply" style="width:100%;padding:10px;font-size:13px;margin-top:8px">Apply</button>
 
 </div>
 </div>
@@ -436,8 +483,25 @@ function loadConf(){
       cfg.active_detector = !!c.active_detector;
       cfg.sensor_width = c.sensor_width||1280;
       cfg.sensor_height= c.sensor_height||720;
+      cfg.hls_width    = c.hls_width    || cfg.sensor_width;
+      cfg.hls_height   = c.hls_height   || cfg.sensor_height;
+      cfg.hls_fps      = (c.hls_fps==null)?5:c.hls_fps;
+      cfg.record_width = c.record_width || cfg.sensor_width;
+      cfg.record_height= c.record_height|| cfg.sensor_height;
+      cfg.record_fps   = (c.record_fps==null)?10:c.record_fps;
+      cfg.rotation_180 = (c.rotation_180==null)?true:!!c.rotation_180;
       const sr=document.getElementById('senRes');
       if(sr) sr.value=cfg.sensor_width+','+cfg.sensor_height;
+      const hr=document.getElementById('hlsRes');
+      if(hr) hr.value=cfg.hls_width+','+cfg.hls_height;
+      const hfps=document.getElementById('hlsFps');
+      if(hfps){hfps.value=cfg.hls_fps; document.getElementById('hlsFpsv').textContent=cfg.hls_fps;}
+      const rr=document.getElementById('recRes');
+      if(rr) rr.value=cfg.record_width+','+cfg.record_height;
+      const rfps=document.getElementById('recFps');
+      if(rfps){rfps.value=cfg.record_fps; document.getElementById('recFpsv').textContent=cfg.record_fps;}
+      const rot=document.getElementById('rot180');
+      if(rot) rot.checked=cfg.rotation_180;
       const fc=document.getElementById('fpsCap');
       const tfps=(c.target_fps==null)?15:c.target_fps;
       if(fc){fc.value=tfps; document.getElementById('fpsv').textContent=tfps==0?'off':tfps;}
@@ -1015,10 +1079,29 @@ function renderDzList(){
   const b=document.getElementById('activeBtn');
   if(b) b.textContent='Zone 1 follower: '+(cfg.active_detector?'ON':'OFF');
 }
-function applyAll(){
+function applyAll(opts){
+  const doReboot = !!(opts && opts.reboot);
   const sr=document.getElementById('senRes').value.split(',');
   cfg.sensor_width=parseInt(sr[0]);
   cfg.sensor_height=parseInt(sr[1]);
+  const hr=document.getElementById('hlsRes');
+  if(hr){
+    const hv=hr.value.split(',');
+    cfg.hls_width =parseInt(hv[0]);
+    cfg.hls_height=parseInt(hv[1]);
+  }
+  const hf=document.getElementById('hlsFps');
+  if(hf) cfg.hls_fps=parseInt(hf.value);
+  const rr=document.getElementById('recRes');
+  if(rr){
+    const rv=rr.value.split(',');
+    cfg.record_width =parseInt(rv[0]);
+    cfg.record_height=parseInt(rv[1]);
+  }
+  const rf=document.getElementById('recFps');
+  if(rf) cfg.record_fps=parseInt(rf.value);
+  const rot=document.getElementById('rot180');
+  if(rot) cfg.rotation_180=!!rot.checked;
   const sw=cfg.sensor_width, sh=cfg.sensor_height;
   (cfg.detection_zones||[]).forEach(z=>{
     z.size=Math.max(INFER_SZ,z.size||INFER_SZ);  // minimum size only; zone may exceed frame
@@ -1029,16 +1112,22 @@ function applyAll(){
   renderDzList();
   const btns=document.querySelectorAll('.apply-all-btn');
   btns.forEach(b=>{b.disabled=true;b.textContent='Applying...';});
+  const restoreBtns=()=>btns.forEach(b=>{b.disabled=false;b.innerHTML=b.dataset.label||'Apply';});
   fetch('http://'+ip+':7778/api/config',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(cfg)
   }).then(()=>{
     dzCfgDirty=false;
-    setStatus('Saved. Reboot to apply hardware changes.');
-    btns.forEach(b=>{b.disabled=false;b.textContent='Apply';});
+    if(doReboot){
+      setStatus('Saved. Rebooting... (~45s)');
+      fetch('http://'+ip+':7778/api/reboot',{method:'POST'}).catch(()=>{});
+    } else {
+      setStatus('Saved.');
+    }
+    restoreBtns();
   }).catch(e=>{
     setStatus(''+e);
-    btns.forEach(b=>{b.disabled=false;b.textContent='Apply';});
+    restoreBtns();
   });
 }
 function applyDetector(){applyAll();}
@@ -1212,6 +1301,50 @@ function showMainTab(name, btn){
 
 if(document.getElementById('ip').value) connect();
 
+let _hlsWatchdogTimer = null;
+let _hlsLastTime = 0;
+let _hlsStallCount = 0;
+function _armHlsWatchdog(){
+  if (_hlsWatchdogTimer) { clearInterval(_hlsWatchdogTimer); _hlsWatchdogTimer = null; }
+  _hlsLastTime = 0; _hlsStallCount = 0;
+  _hlsWatchdogTimer = setInterval(() => {
+    if (_streamMode !== 'hls') return;
+    const v = document.getElementById('hlsPlayer');
+    if (!v || v.paused || document.hidden) return;
+    if (v.currentTime === _hlsLastTime) {
+      _hlsStallCount++;
+      if (_hlsStallCount >= 2) {
+        _hlsStallCount = 0;
+        try {
+          const b = v.buffered;
+          if (b.length && b.end(b.length-1) - v.currentTime > 1) {
+            v.currentTime = b.end(b.length-1) - 0.5;
+            v.play().catch(()=>{});
+            return;
+          }
+        } catch(_) {}
+        setStream('hls');
+      }
+    } else {
+      _hlsStallCount = 0;
+      _hlsLastTime = v.currentTime;
+    }
+  }, 5000);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (_streamMode !== 'hls') return;
+  const v = document.getElementById('hlsPlayer');
+  if (!v) return;
+  try {
+    const b = v.buffered;
+    if (b.length && b.end(b.length-1) - v.currentTime > 3) {
+      v.currentTime = b.end(b.length-1) - 0.5;
+    }
+    v.play().catch(()=>{ setStream('hls'); });
+  } catch(_) { setStream('hls'); }
+});
+
 // ---- HLS player (rotation handled by VPSS hardware: bMirror+bFlip in capture_cvi.cpp) ----
 function setStream(mode) {
   const ip      = document.getElementById('ip').value.trim();
@@ -1234,9 +1367,19 @@ function setStream(mode) {
       _hlsObj.loadSource(hlsUrl);
       _hlsObj.attachMedia(hlsEl);
       _hlsObj.on(Hls.Events.MANIFEST_PARSED, () => hlsEl.play().catch(()=>{}));
+      _hlsObj.on(Hls.Events.ERROR, (_e, data) => {
+        if (!data || !data.fatal) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          try { _hlsObj.startLoad(); return; } catch(_) {}
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          try { _hlsObj.recoverMediaError(); return; } catch(_) {}
+        }
+        setTimeout(() => { if (_streamMode === 'hls') setStream('hls'); }, 500);
+      });
     } else if (hlsEl.canPlayType('application/vnd.apple.mpegurl')) {
       hlsEl.src = hlsUrl; hlsEl.play().catch(()=>{});
     }
+    _armHlsWatchdog();
   } else {
     if (_hlsObj) { _hlsObj.destroy(); _hlsObj = null; }
     hlsEl.src = ''; hlsEl.style.display = 'none';
