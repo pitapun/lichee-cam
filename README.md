@@ -1,7 +1,22 @@
 # lichee-cam / NintiDetect
 
 YOLOv8 object detector on LicheeRV Nano (cv181x SoC, GC4653 sensor).
-Serves MJPEG stream, HLS live stream, and a web UI with event recording.
+Serves WS H264 live stream, MJPEG fallback, and a web UI with event recording.
+
+---
+
+## Documentation
+
+Current docs:
+
+- `ARCHITECTURE.md`: process model, VPSS/VENC channels, zones, memory notes.
+- `LIVE_STREAM.md`: WS live endpoint, WSFS packet format, JMuxer, checks.
+- `UI_OVERLAYS.md`: live/zone tab overlay rules and flicker prevention.
+- `EVENT_RECORDING.md`: event lifecycle, stop policy, stationary suppression.
+- `PERFORMANCE_AND_TUNING.md`: resolution/fps roles and tuning order.
+- `OPERATIONS.md`: deploy, health checks, memory checks, external Frigate note.
+- `BUILD.md`: cross-compilation.
+- `DEPLOY_CHECKLIST.md`: deploy checklist.
 
 ---
 
@@ -13,7 +28,8 @@ Everything needed on the device. Deploy all of these on a fresh install.
 |----------|-------------|-------|
 | `sidecar.py` | `/root/sidecar.py` | Main process: manages stream_yolo, tracking, web server |
 | `index.html` | `/root/index.html` | Web UI HTML (read from disk — update without restart) |
-| `hls.min.js` | `/root/hls.min.js` | HLS.js player for live stream tab |
+| `jmuxer.min.js` | `/root/jmuxer.min.js` | JMuxer player for WS H264 live stream |
+| `hls.min.js` | `/root/hls.min.js` | Legacy HLS.js asset; not used by primary WS live stream |
 | `S98ninti_sidecar` | `/etc/init.d/S98ninti_sidecar` | Init script (chmod +x after copy) |
 | `bin/stream_yolo` | `/root/stream_yolo` | Compiled RISC-V binary (or build from `src/`) |
 | `bin/mediamtx` | `/root/mediamtx` | RTSP relay (optional) |
@@ -134,24 +150,31 @@ git add bin/stream_yolo && git commit -m "..."
 ```
 sidecar.py
   ├── launches stream_yolo as subprocess
-  ├── reads MJPEG frames from :7777 → pre-buffer + event JPEG frames
+  ├── serves WS H264 live on :7778/ws/live
   ├── receives detection UDP from stream_yolo (:5005)
   ├── tracks objects, manages event lifecycle
   ├── serves web UI on :7778 (index.html read from disk)
-  └── serves HLS via ffmpeg → /tmp/hls/
+  └── serves event video/metadata
 
 stream_yolo (C++)
-  ├── VPSS group 0: captures from GC4653 (1280x720 disp + 2560x1440 raw)
-  ├── CHN0 VENC: HLS encoder (1280x720 H264 → /tmp/hls_feed.h264 FIFO)
-  ├── CHN1 VENC: event recorder (2560x1440 H264, active during events only)
+  ├── CHN0 BGR: YOLO + motion source
+  ├── CHN1 NV21: WS live encoder
+  ├── CHN2 NV21: event recorder, active during events only
   ├── YOLO inference on cv181x NPU (640x640 zone crop)
-  └── MJPEG output on :7777
+  └── optional MJPEG fallback output on :7777
 ```
 
 Key constraints:
-- CHN0 and CHN1 cannot run simultaneously — CHN0 paused during events, resumed after
+- WS live uses legacy internal `HLS` env names in some C++/sidecar code.
 - Single-core C906 RISC-V: `cv::setNumThreads(1)` prevents OpenMP overhead
 - ION memory (VENC input): written via manual BGR→NV21 loop, not cvtColor
+
+---
+
+## Event recording
+
+See `EVENT_RECORDING.md` for the intended event lifecycle, stop conditions,
+timeouts, and stationary-suppression rules.
 
 ---
 
@@ -161,12 +184,27 @@ Key constraints:
 
 ```json
 {
-  "threshold": 0.55,
-  "zones": [{"x": 573, "y": 169, "size": 640}],
-  "filter_classes": ["person", "cat", "dog"],
+  "threshold": 0.50,
+  "zones": [
+    {"name": "Front", "enabled": true, "points": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]]}
+  ],
+  "filter_classes": ["person", "vehicle"],
   "motion_enabled": true,
+  "yolo_motion_enabled": true,
+  "yolo_motion_source": "bgr",
   "motion_sensitivity": 10,
-  "fps_cap": 5
+  "detection_zones": [{"x": 630, "y": 81, "size": 821}],
+  "active_detector": true,
+  "sensor_width": 1920,
+  "sensor_height": 1080,
+  "target_fps": 10,
+  "ws_width": 854,
+  "ws_height": 480,
+  "ws_fps": 10,
+  "record_width": 1920,
+  "record_height": 1080,
+  "record_fps": 10,
+  "rotation_180": true
 }
 ```
 

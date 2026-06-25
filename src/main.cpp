@@ -878,6 +878,10 @@ int main(int argc, char *argv[]) {
     cv::Mat diff;
     cv::Mat gray;
     cv::Mat mask;
+    cv::Mat hls_y_small;
+    cv::Mat hls_y_prev;
+    cv::Mat hls_y_diff;
+    cv::Mat hls_y_mask;
     cv::Mat disp_out;
     std::vector<TileDet> all_dets;
     std::vector<bool> suppressed;
@@ -889,6 +893,8 @@ int main(int argc, char *argv[]) {
     // Browser MJPEG preview is only for aiming/config. Keep it low-res and
     // throttled so JPEG encoding does not heat the SoC.
     cv::Mat prev_small;
+    const bool MOTION_FROM_HLS_Y = env_on("YOLO_MOTION_FROM_HLS_Y");
+    fprintf(stderr, "[motion] source=%s\n", MOTION_FROM_HLS_Y ? "hls_y" : "bgr");
     // HLS must advertise a frame rate close to the frame cadence we can
     // actually sustain. If this is higher than the real send rate, players
     // fast-forward during playback because the H264 stream timestamps imply
@@ -1200,11 +1206,46 @@ int main(int argc, char *argv[]) {
         }
         long t1b = now_ms();  // after HLS send
         acc_clone += t1a - t1; acc_hls_send += t1b - t1a;
+
+        // Motion detection before box drawing. In the default path it runs on
+        // CHN0 BGR after releasing VPSS buffers. The experimental hls_y path
+        // reuses the already-acquired CHN1 NV12 luma plane, avoiding CHN0 BGR
+        // resize/absdiff work without adding another frame acquire.
+        bool motion = false;
+        bool motion_done = MOTION_FROM_HLS_Y;
+        if (ENABLE_MOTION && MOTION_FROM_HLS_Y && hls_nv21) {
+            VIDEO_FRAME_S& vf = hls_nv21->stVFrame;
+            int w = (int)vf.u32Width, h = (int)vf.u32Height;
+            int stride = (int)vf.u32Stride[0];
+            uint8_t* y = vf.pu8VirAddr[0];
+            if (y && w > 0 && h > 0 && stride >= w) {
+                cv::Mat y_full(h, w, CV_8UC1, y, stride);
+                int mw = std::min(320, w);
+                int mh = std::min(180, h);
+                cv::resize(y_full, hls_y_small, cv::Size(mw, mh), 0, 0, cv::INTER_NEAREST);
+                motion = hls_y_prev.empty();
+                if (!motion) {
+                    cv::absdiff(hls_y_small, hls_y_prev, hls_y_diff);
+                    cv::threshold(hls_y_diff, hls_y_mask, 6, 255, cv::THRESH_BINARY);
+                    cv::Moments mom = cv::moments(hls_y_mask, true);
+                    double moving_px = mom.m00;
+                    cv::Scalar m = cv::mean(hls_y_diff);
+                    motion = moving_px > 20.0 || m[0] > motion_thresh * 0.15f;
+                    if (motion && active_follower) {
+                        if (moving_px > 20.0) {
+                            motion_cx = (int)(mom.m10 / mom.m00 * (double)disp.cols / mw);
+                            motion_cy = (int)(mom.m01 / mom.m00 * (double)disp.rows / mh);
+                        }
+                    }
+                }
+                hls_y_small.copyTo(hls_y_prev);
+                motion_done = true;
+            }
+        }
+
         cap.releaseImagePtr();
 
-        // Motion detection on raw frame (before box drawing) at 1/4 res
-        bool motion = false;
-        if (ENABLE_MOTION) {
+        if (ENABLE_MOTION && !motion_done) {
             cv::resize(disp, small, cv::Size(disp.cols/4, disp.rows/4), 0, 0, cv::INTER_NEAREST);
             motion = prev_small.empty();
             if (!motion) {

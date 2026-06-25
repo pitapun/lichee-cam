@@ -38,6 +38,8 @@ DEFAULT_CONFIG = {
     'zones': [],
     'filter_classes': ['person', 'vehicle', 'animal'],
     'motion_enabled': True,
+    'yolo_motion_enabled': True,
+    'yolo_motion_source': 'bgr',
     'motion_sensitivity': 20,
     # Detection zones fed to YOLO: list of {"x":int,"y":int,"size":int}.
     # size defaults to 640 (= model input); larger sizes capture a wider region
@@ -49,14 +51,14 @@ DEFAULT_CONFIG = {
     # UI renders this zone in orange instead of yellow.
     'active_detector': False,
     # CHN0 BGR (YOLO + motion). Picked up by capture_cvi.cpp via
-    # cap.set(WIDTH/HEIGHT); also used as the fallback for hls_w/h and
+    # cap.set(WIDTH/HEIGHT); also used as the fallback for ws_w/h and
     # record_w/h when those are unset.
     'sensor_width':  1920,
     'sensor_height': 1080,
-    # CHN1 NV21 -> HLS encoder. Independent of CHN0; VPSS HW scales.
-    'hls_width':  1280,
-    'hls_height': 720,
-    'hls_fps': 5,
+    # CHN1 NV21 -> WS live encoder. Independent of CHN0; VPSS HW scales.
+    'ws_width':  1280,
+    'ws_height': 720,
+    'ws_fps': 5,
     # CHN2 NV21 -> Record encoder. Independent of CHN0/CHN1.
     'record_width':  1920,
     'record_height': 1080,
@@ -78,7 +80,7 @@ DEFAULT_CONFIG = {
 }
 INFER_SIZE = 640
 MAX_ZONES  = 4
-SENSOR_RES_OPTIONS = [(1920, 1080), (2560, 1440)]
+SENSOR_RES_OPTIONS = [(1280, 720), (1920, 1080), (2560, 1440)]
 
 def normalize_camera_resolution(values, *, force=False):
     if not force and 'sensor_width' not in values and 'sensor_height' not in values:
@@ -175,8 +177,8 @@ def _ws_live_client_count():
 def _ws_live_make_packet(payload, keyframe=False):
     global _ws_live_seq
     with config_lock:
-        width = int(cfg.get('hls_width') or cfg.get('sensor_width') or 0)
-        height = int(cfg.get('hls_height') or cfg.get('sensor_height') or 0)
+        width = int(cfg.get('ws_width') or cfg.get('hls_width') or cfg.get('sensor_width') or 0)
+        height = int(cfg.get('ws_height') or cfg.get('hls_height') or cfg.get('sensor_height') or 0)
     _ws_live_seq = (_ws_live_seq + 1) & 0xffffffff
     ts_us = int(time.time() * 1000000)
     header = bytearray(64)
@@ -334,7 +336,7 @@ TRACK_CENTER_THRESHOLD = 0.25
 TRACK_CONFIRM_HITS = 2
 TRACK_LOST_TIMEOUT = 2.5    # object not detected for 2.5s -> gone
 TRACK_STILL_TIMEOUT = 5.0   # object not moving for 5s -> gone
-RECORD_STILL_TIMEOUT = 2.5  # during recording, stationary object ends the clip
+RECORD_LOST_TIMEOUT = 1.0   # during recording, stop 1s after object disappears
 TRACK_MOVE_THRESHOLD = 0.04 # min center shift (normalised) to count as movement
 STATIONARY_SUPPRESS_ABSENT_TIMEOUT = 60.0
 STATIONARY_SUPPRESS_CENTER_THRESHOLD = 0.20
@@ -970,12 +972,22 @@ def _storage_cleanup_loop():
 def _effective_hls_fps(fps=None):
     if fps is None:
         with config_lock:
-            fps = cfg.get('target_fps', 0) or 5
+            fps = cfg.get('ws_fps', cfg.get('hls_fps', 0)) or 5
     try:
         fps = int(float(fps))
     except Exception:
         fps = 5
     return max(1, min(fps, 5))
+
+def _effective_record_fps(fps=None):
+    if fps is None:
+        with config_lock:
+            fps = cfg.get('record_fps', 0) or cfg.get('target_fps', 0) or EVENT_VIDEO_FPS
+    try:
+        fps = float(fps)
+    except Exception:
+        fps = float(EVENT_VIDEO_FPS)
+    return max(1.0, min(fps, 30.0))
 
 def _count_h264_frames(h264_in):
     try:
@@ -984,7 +996,7 @@ def _count_h264_frames(h264_in):
             '-select_streams', 'v:0',
             '-show_entries', 'stream=nb_read_frames',
             '-of', 'default=nw=1:nk=1', h264_in
-        ], stderr=subprocess.DEVNULL, timeout=10).decode().strip()
+        ], stderr=subprocess.DEVNULL, timeout=2).decode().strip()
         for line in out.splitlines():
             line = line.strip()
             if line.isdigit():
@@ -1100,9 +1112,9 @@ def _finish_event_video(tr, save, now):
     out_mp4 = os.path.join(event_dir, 'event.mp4')
     if os.path.exists(h264_in):
         h264_duration = max(0.1, now - rec.get('started_at', now) + H264_PREROLL_SECS)
-        record_fps = _h264_remux_fps(h264_in, h264_duration, _effective_hls_fps(rec['fps']))
+        record_fps = _h264_remux_fps(h264_in, h264_duration, _effective_record_fps())
     else:
-        record_fps = rec['fps']
+        record_fps = _effective_record_fps(rec['fps'])
     ok = _run_ffmpeg(frames_dir, out_mp4, rec['fps'], h264_in, record_fps)
     if ok and not thumb_ok:
         # Decoding a 2560x1440 mp4 to extract one frame at native size
@@ -1153,16 +1165,23 @@ def _expire_tracks(now=None):
         for tid, tr in list(tracks.items()):
             recording = tid in recording_ids
             if recording:
-                lost  = now - tr.get('last_seen', now) > TRACK_LOST_TIMEOUT
-                still = now - tr.get('last_moved', now) > RECORD_STILL_TIMEOUT
+                lost  = now - tr.get('last_seen', now) > RECORD_LOST_TIMEOUT
+                still = False
             else:
                 lost  = now - tr.get('last_seen',  now) > TRACK_LOST_TIMEOUT
                 still = now - tr.get('last_moved', now) > TRACK_STILL_TIMEOUT
             maxed = tr.get('confirmed') and now - tr.get('first_seen', now) >= MAX_RECORD_SECS
             if (lost or still or maxed) and now >= tr.get('min_record_until', 0):
-                expired.append(tid)
-        for tid in expired:
+                if maxed:
+                    reason = 'maxed'
+                elif still:
+                    reason = 'still'
+                else:
+                    reason = 'lost'
+                expired.append((tid, reason))
+        for tid, reason in expired:
             tr = tracks.pop(tid, {})
+            tr['end_reason'] = reason
             duration = now - tr.get('first_seen', now)
             fps = float(cfg.get('target_fps') or EVENT_VIDEO_FPS)
             min_dur = 2.0 / fps  # discard if shorter than 2 frames
@@ -1178,7 +1197,8 @@ def _expire_tracks(now=None):
                     tr['num_frames'] = video_meta.get('num_frames')
                     tr['record_fps'] = video_meta.get('record_fps')
                 _write_event('end', tr, now)
-                _remember_stationary_suppression(tr, now)
+                if reason == 'still':
+                    _remember_stationary_suppression(tr, now)
                 msg = 'data: ' + json.dumps({'_save': True, 'track_id': tid,
                                               'name': tr.get('name', '?'),
                                               'hits': tr.get('hits', 0),
@@ -1387,13 +1407,13 @@ def _start_yolo_inner():
             env['YOLO_SNS'] = str(cfg['sensor_driver'])
         thresh = str(cfg.get('threshold', 0.45))
         sw, sh = normalize_camera_resolution(cfg, force=True)
-        # Per-VPSS-chn dims + fps. CHN1 (HLS) and CHN2 (Record) are scaled
+        # Per-VPSS-chn dims + fps. CHN1 (WS live) and CHN2 (Record) are scaled
         # by VPSS HW directly from sensor raw; they are independent of CHN0
         # (and of each other). Clamp to sensor raw (2560x1440 on GC4653)
         # and floor at 64 so the encoder doesn't reject the size.
         SENSOR_MAX_W, SENSOR_MAX_H = 2560, 1440
-        hw = int(cfg.get('hls_width')  or sw)
-        hh = int(cfg.get('hls_height') or sh)
+        hw = int(cfg.get('ws_width')  or cfg.get('hls_width')  or sw)
+        hh = int(cfg.get('ws_height') or cfg.get('hls_height') or sh)
         hw = max(64, min(hw, SENSOR_MAX_W))
         hh = max(64, min(hh, SENSOR_MAX_H))
         env['YOLO_HLS_W'] = str(hw)
@@ -1405,13 +1425,17 @@ def _start_yolo_inner():
         env['YOLO_REC_W'] = str(rw_cfg)
         env['YOLO_REC_H'] = str(rh_cfg)
         tfps_cap = int(cfg.get('target_fps', 0) or 30)
-        hfps = int(cfg.get('hls_fps', 0) or 0)
-        if hfps > 0: env['YOLO_HLS_FPS'] = str(max(1, min(hfps, tfps_cap)))
+        wfps = int(cfg.get('ws_fps', cfg.get('hls_fps', 0)) or 0)
+        if wfps > 0: env['YOLO_HLS_FPS'] = str(max(1, min(wfps, tfps_cap)))
         rfps = int(cfg.get('record_fps', 0) or 0)
         if rfps > 0: env['YOLO_REC_FPS'] = str(max(1, min(rfps, tfps_cap)))
         # Rotation: VPSS HW mirror+flip on all three chns. Default ON
         # because the GC4653 module is physically upside-down.
         env['YOLO_ROTATE'] = '1' if cfg.get('rotation_180', True) else '0'
+        if not cfg.get('yolo_motion_enabled', True):
+            env['YOLO_DISABLE_MOTION'] = '1'
+        if str(cfg.get('yolo_motion_source', 'bgr')) == 'hls_y':
+            env['YOLO_MOTION_FROM_HLS_Y'] = '1'
         # Build --zones "x,y;x,y;..." (clamped to frame). Empty list -> auto-
         # populate a single center zone and persist, so the UI yellow box
         # matches what stream_yolo actually crops.
@@ -1445,7 +1469,8 @@ def _start_yolo_inner():
         args += ['--motion-thresh', f'{msen / 5.0:.2f}']
         print(f'[yolo] starting threshold={thresh} sensor={sw}x{sh} '
               f'zones={clamped} active={cfg.get("active_detector",False)} '
-              f'fps_cap={tfps or "off"}')
+              f'fps_cap={tfps or "off"} yolo_motion={cfg.get("yolo_motion_enabled", True)} '
+              f'motion_source={cfg.get("yolo_motion_source", "bgr")}')
         _stop_live_ws_stream()
         yolo_log = open('/tmp/stream_yolo.log', 'a')
         yolo_log.write(f'\n[yolo] exec start ts={time.strftime("%Y-%m-%d %H:%M:%S")}\n')
@@ -2133,6 +2158,11 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
 <script>
 const PALETTE=['#f55','#5af','#5f5','#fa5','#a5f','#ff5','#5ff'];
 const INFER_SZ=640; const MAX_DET_ZONES=4;
+function hexToRgba(hex,a){
+  const h=hex.replace('#','');
+  const r=parseInt(h[0]+h[0],16), g=parseInt(h[1]+h[1],16), b=parseInt(h[2]+h[2],16);
+  return `rgba(${r},${g},${b},${a})`;
+}
 let liveActiveZone=null;  // [x,y,size] from stream_yolo when active follower is on
 let liveActiveZoneTs=0;
 // When the user drags the active zone, suppress live-position overrides on the
@@ -2541,12 +2571,16 @@ function syncCvs(){
   const scale=Math.min(lr.width/nw, lr.height/nh);
   const rw=nw*scale, rh=nh*scale;
   const rx=(lr.width-rw)/2, ry=(lr.height-rh)/2;
-  cvs.width=nw;
-  cvs.height=nh;
-  cvs.style.left=(lr.left-pr.left+rx)+'px';
-  cvs.style.top=(lr.top-pr.top+ry)+'px';
-  cvs.style.width=rw+'px';
-  cvs.style.height=rh+'px';
+  if(cvs.width!==nw)cvs.width=nw;
+  if(cvs.height!==nh)cvs.height=nh;
+  const left=(lr.left-pr.left+rx)+'px';
+  const top=(lr.top-pr.top+ry)+'px';
+  const width=rw+'px';
+  const height=rh+'px';
+  if(cvs.style.left!==left)cvs.style.left=left;
+  if(cvs.style.top!==top)cvs.style.top=top;
+  if(cvs.style.width!==width)cvs.style.width=width;
+  if(cvs.style.height!==height)cvs.style.height=height;
 }
 streamEl.onload=syncCvs;
 document.getElementById('hlsPlayer').addEventListener('loadedmetadata',syncCvs);
@@ -2757,56 +2791,70 @@ function closeZone(){
 }
 
 // Render loop
+function isZoneEditorActive(){
+  const zoneTab=document.getElementById('main-zone');
+  return !!(zoneTab && zoneTab.classList.contains('active'));
+}
+
 function frame(){
   syncCvs();
   const W=cvs.width,H=cvs.height;
   ctx.clearRect(0,0,W,H);
 
-  // Detection zones (yellow dashed normal; orange when zone 0 is active follower).
-  // While stream_yolo is reporting live _active_zone, zone 0 renders at the
-  // tracked position instead of the config position.
+  const showZones=isZoneEditorActive();
   const sw=cfg.sensor_width||1280, sh=cfg.sensor_height||720;
-  (cfg.detection_zones||[]).forEach((z,i)=>{
-    const isActive=(i===0 && !!cfg.active_detector);
-    const dragging=dzDrag&&dzDrag.idx===i;
-    let zx=z.x, zy=z.y, zs=z.size||INFER_SZ;
-    // Show live position only when active and the user isn't editing.
-    if(isActive && liveActiveZone && !dragging && !dzCfgDirty){
-      zx=liveActiveZone[0]; zy=liveActiveZone[1]; zs=liveActiveZone[2];
-    }
-    const x=zx*W/sw, y=zy*H/sh;
-    const w=zs*W/sw, h=zs*H/sh;
-    const col=isActive?'#ff8800':'#ffcc00';
-    ctx.setLineDash([8,4]);
-    ctx.strokeStyle=dragging?'#ff0':col;
-    ctx.lineWidth=dragging?3:2;
-    ctx.strokeRect(x,y,w,h);
-    ctx.setLineDash([]);
-    ctx.fillStyle=isActive?'rgba(255,136,0,0.10)':'rgba(255,204,0,0.10)';
-    ctx.fillRect(x,y,w,h);
-    // Resize handle (right-bottom corner) -- 32 sensor px -> scale
-    const hsx=Math.max(4, 32*W/sw), hsy=Math.max(4, 32*H/sh);
-    ctx.fillStyle=col;
-    ctx.fillRect(x+w-hsx, y+h-hsy, hsx, hsy);
-    ctx.font='11px monospace';
-    ctx.fillText('zone '+(i+1)+(isActive?' [active]':'')+' ('+zx+','+zy+') sz='+zs, x+4, y+13);
-  });
+  if(showZones){
+    // Detection zones (yellow normal; orange when zone 0 is active follower).
+    // Keep these off the live tab so they do not cover the stream.
+    (cfg.detection_zones||[]).forEach((z,i)=>{
+      const isActive=(i===0 && !!cfg.active_detector);
+      const dragging=dzDrag&&dzDrag.idx===i;
+      let zx=z.x, zy=z.y, zs=z.size||INFER_SZ;
+      // Show live position only when active and the user isn't editing.
+      if(isActive && liveActiveZone && !dragging && !dzCfgDirty){
+        zx=liveActiveZone[0]; zy=liveActiveZone[1]; zs=liveActiveZone[2];
+      }
+      const x=zx*W/sw, y=zy*H/sh;
+      const w=zs*W/sw, h=zs*H/sh;
+      const col=isActive?'#ff8800':'#ffcc00';
+      ctx.setLineDash([]);
+      ctx.strokeStyle=dragging?'#ff0':col;
+      ctx.lineWidth=dragging?3:2;
+      ctx.strokeRect(x,y,w,h);
+      ctx.fillStyle=isActive?'rgba(255,136,0,0.04)':'rgba(255,204,0,0.04)';
+      ctx.fillRect(x,y,w,h);
+      // Resize handle (right-bottom corner) -- 32 sensor px -> scale
+      const hsx=Math.max(4, 32*W/sw), hsy=Math.max(4, 32*H/sh);
+      ctx.fillStyle=col;
+      ctx.fillRect(x+w-hsx, y+h-hsy, hsx, hsy);
+      ctx.font='11px monospace';
+      ctx.fillText('zone '+(i+1)+(isActive?' [active]':'')+' ('+zx+','+zy+') sz='+zs, x+4, y+13);
+    });
+  }
 
-  cfg.zones.forEach((z,i)=>{
-    if(!z.points||z.points.length<2)return;
-    const col=PALETTE[i%PALETTE.length];
-    ctx.beginPath();
-    const[x0,y0]=normToCanvas(z.points[0][0],z.points[0][1]);
-    ctx.moveTo(x0,y0);
-    z.points.slice(1).forEach(p=>{const[x,y]=normToCanvas(p[0],p[1]);ctx.lineTo(x,y);});
-    ctx.closePath();
-    ctx.strokeStyle=col; ctx.lineWidth=2; ctx.stroke();
-    ctx.fillStyle=col+'28'; ctx.fill();
-    ctx.fillStyle=col; ctx.font='11px monospace';
-    ctx.fillText(z.name,x0+3,y0-4);
-    if(!z.enabled){ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fill();}
-  });
-  if(drawing&&drawing.pts.length>0){
+  if(showZones){
+    cfg.zones.forEach((z,i)=>{
+      if(!z.points||z.points.length<2)return;
+      const col=PALETTE[i%PALETTE.length];
+      ctx.beginPath();
+      const[x0,y0]=normToCanvas(z.points[0][0],z.points[0][1]);
+      ctx.moveTo(x0,y0);
+      z.points.slice(1).forEach(p=>{const[x,y]=normToCanvas(p[0],p[1]);ctx.lineTo(x,y);});
+      ctx.closePath();
+      ctx.strokeStyle=col; ctx.lineWidth=2; ctx.stroke();
+      ctx.fillStyle=hexToRgba(col,0.04); ctx.fill();
+      ctx.fillStyle=col; ctx.font='11px monospace';
+      ctx.fillText(z.name,x0+3,y0-4);
+      if(!z.enabled){
+        ctx.strokeStyle='rgba(180,180,180,0.65)';
+        ctx.lineWidth=1;
+        ctx.stroke();
+        ctx.fillStyle='rgba(180,180,180,0.9)';
+        ctx.fillText('disabled',x0+3,y0+10);
+      }
+    });
+  }
+  if(showZones&&drawing&&drawing.pts.length>0){
     ctx.setLineDash([5,4]);
     ctx.strokeStyle='#fff'; ctx.lineWidth=1.5;
     ctx.beginPath();

@@ -33,8 +33,8 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 #live-video-slot,#zone-video-slot{flex:1;min-width:0;min-height:0;position:relative;display:flex}
 #stream-area{flex:1;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}
 #stream{display:block;width:100%;height:100%;object-fit:contain;image-rendering:pixelated}
-#hlsPlayer{display:none;width:100%;height:100%;object-fit:contain}
-#hlsCanvas{display:none;width:100%;height:100%}
+#wsPlayer{display:none;width:100%;height:100%;object-fit:contain}
+#wsCanvas{display:none;width:100%;height:100%}
 #overlay{position:absolute;cursor:crosshair}
 #stream-btns{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);display:flex;gap:6px}
 
@@ -183,8 +183,8 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   <div id="live-video-slot">
   <div id="stream-area">
     <img id="stream" src="" alt="stream offline">
-    <video id="hlsPlayer" muted autoplay playsinline style="display:none"></video>
-    <canvas id="hlsCanvas" style="display:none;width:100%;height:100%;object-fit:contain"></canvas>
+    <video id="wsPlayer" muted autoplay playsinline style="display:none"></video>
+    <canvas id="wsCanvas" style="display:none;width:100%;height:100%;object-fit:contain"></canvas>
     <canvas id="overlay"></canvas>
     <div id="stream-btns">
       <button onclick="setStream('ws')"    id="btnWs">WS</button>
@@ -331,10 +331,10 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   </div>
 
   <div class="s-section">
-    <h2>HLS stream</h2>
+    <h2>WS stream</h2>
     <div class="s-row">
       <span class="s-label">Resolution</span>
-      <select id="hlsRes" style="flex:1">
+      <select id="wsRes" style="flex:1">
         <option value="640,360">640 x 360</option>
         <option value="854,480">854 x 480</option>
         <option value="1280,720">1280 x 720</option>
@@ -344,9 +344,9 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
     </div>
     <div class="s-row">
       <span class="s-label">FPS</span>
-      <input type="range" id="hlsFps" min="1" max="30" step="1" value="5" style="flex:1"
-             oninput="document.getElementById('hlsFpsv').textContent=this.value">
-      <span id="hlsFpsv" style="width:32px;text-align:right">5</span>
+      <input type="range" id="wsFps" min="1" max="30" step="1" value="5" style="flex:1"
+             oninput="document.getElementById('wsFpsv').textContent=this.value">
+      <span id="wsFpsv" style="width:32px;text-align:right">5</span>
     </div>
   </div>
 
@@ -372,7 +372,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
 
   <button onclick="applyAll({reboot:true})" class="act apply-all-btn" data-label="Apply &amp; Reboot"
           style="width:100%;padding:10px;font-size:13px;margin-top:4px;background:#3a2a2a;border-color:#6a4040">Apply &amp; Reboot</button>
-  <div class="hint" style="font-size:10px;color:#666;text-align:center;margin:2px 0 12px">Camera / HLS / Record changes require reboot</div>
+  <div class="hint" style="font-size:10px;color:#666;text-align:center;margin:2px 0 12px">Camera / WS / Record changes require reboot</div>
 
   <div class="s-section">
     <h2>Threshold</h2>
@@ -422,6 +422,11 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
 <script>
 const PALETTE=['#f55','#5af','#5f5','#fa5','#a5f','#ff5','#5ff'];
 const INFER_SZ=640; const MAX_DET_ZONES=4;
+function hexToRgba(hex,a){
+  const h=hex.replace('#','');
+  const r=parseInt(h[0]+h[0],16), g=parseInt(h[1]+h[1],16), b=parseInt(h[2]+h[2],16);
+  return `rgba(${r},${g},${b},${a})`;
+}
 let liveActiveZone=null;  // [x,y,size] from stream_yolo when active follower is on
 let liveActiveZoneTs=0;
 // When the user drags the active zone, suppress live-position overrides on the
@@ -435,6 +440,7 @@ let cfg={mode:'ninti',threshold:0.45,zones:[],filter_classes:['person','vehicle'
 let drawing=null;
 let hover=null;
 let flashes=[];
+let latestBoxes=new Map();
 let ip='';
 let es=null;
 let pendingMode='ninti';
@@ -482,23 +488,19 @@ function loadConf(){
       cfg.active_detector = !!c.active_detector;
       cfg.sensor_width = c.sensor_width||1920;
       cfg.sensor_height= c.sensor_height||1080;
-      if(cfg.sensor_width===1280 && cfg.sensor_height===720){
-        cfg.sensor_width=1920;
-        cfg.sensor_height=1080;
-      }
-      cfg.hls_width    = c.hls_width    || cfg.sensor_width;
-      cfg.hls_height   = c.hls_height   || cfg.sensor_height;
-      cfg.hls_fps      = (c.hls_fps==null)?5:c.hls_fps;
+      cfg.ws_width     = c.ws_width     || c.hls_width  || cfg.sensor_width;
+      cfg.ws_height    = c.ws_height    || c.hls_height || cfg.sensor_height;
+      cfg.ws_fps       = (c.ws_fps==null)?((c.hls_fps==null)?5:c.hls_fps):c.ws_fps;
       cfg.record_width = c.record_width || cfg.sensor_width;
       cfg.record_height= c.record_height|| cfg.sensor_height;
       cfg.record_fps   = (c.record_fps==null)?10:c.record_fps;
       cfg.rotation_180 = (c.rotation_180==null)?true:!!c.rotation_180;
       const sr=document.getElementById('senRes');
       if(sr) sr.value=cfg.sensor_width+','+cfg.sensor_height;
-      const hr=document.getElementById('hlsRes');
-      if(hr) hr.value=cfg.hls_width+','+cfg.hls_height;
-      const hfps=document.getElementById('hlsFps');
-      if(hfps){hfps.value=cfg.hls_fps; document.getElementById('hlsFpsv').textContent=cfg.hls_fps;}
+      const wr=document.getElementById('wsRes');
+      if(wr) wr.value=cfg.ws_width+','+cfg.ws_height;
+      const wfps=document.getElementById('wsFps');
+      if(wfps){wfps.value=cfg.ws_fps; document.getElementById('wsFpsv').textContent=cfg.ws_fps;}
       const rr=document.getElementById('recRes');
       if(rr) rr.value=cfg.record_width+','+cfg.record_height;
       const rfps=document.getElementById('recFps');
@@ -873,7 +875,8 @@ function onDet(d){
   log.appendChild(ln);
   if(log.children.length>80)log.removeChild(log.firstChild);
   log.scrollTop=log.scrollHeight;
-  flashes.push({...d,t:Date.now()});
+  const boxKey=(d.track_id!=null)?('t'+d.track_id):((d.cls!=null?'c'+d.cls:'obj')+':'+Math.round(d.cx*100)+','+Math.round(d.cy*100));
+  latestBoxes.set(boxKey,{...d,t:Date.now()});
   const now=new Date();
   const ts=now.getHours().toString().padStart(2,'0')+':'+
     now.getMinutes().toString().padStart(2,'0')+':'+
@@ -917,25 +920,29 @@ function onDiscard(d){
 
 // Canvas
 function syncCvs(){
-  const hlsEl=document.getElementById('hlsPlayer');
-  const activeEl=(_streamMode==='ws'&&hlsEl.videoWidth)?hlsEl:streamEl;
+  const wsEl=document.getElementById('wsPlayer');
+  const activeEl=(_streamMode==='ws'&&wsEl.videoWidth)?wsEl:streamEl;
   const lr=activeEl.getBoundingClientRect();
   const pr=activeEl.parentElement.getBoundingClientRect();
-  const nw=(activeEl===hlsEl?hlsEl.videoWidth:activeEl.naturalWidth)||640;
-  const nh=(activeEl===hlsEl?hlsEl.videoHeight:activeEl.naturalHeight)||360;
+  const nw=(activeEl===wsEl?wsEl.videoWidth:activeEl.naturalWidth)||640;
+  const nh=(activeEl===wsEl?wsEl.videoHeight:activeEl.naturalHeight)||360;
   // compute actual rendered rect (object-fit:contain inside lr)
   const scale=Math.min(lr.width/nw, lr.height/nh);
   const rw=nw*scale, rh=nh*scale;
   const rx=(lr.width-rw)/2, ry=(lr.height-rh)/2;
-  cvs.width=nw;
-  cvs.height=nh;
-  cvs.style.left=(lr.left-pr.left+rx)+'px';
-  cvs.style.top=(lr.top-pr.top+ry)+'px';
-  cvs.style.width=rw+'px';
-  cvs.style.height=rh+'px';
+  if(cvs.width!==nw)cvs.width=nw;
+  if(cvs.height!==nh)cvs.height=nh;
+  const left=(lr.left-pr.left+rx)+'px';
+  const top=(lr.top-pr.top+ry)+'px';
+  const width=rw+'px';
+  const height=rh+'px';
+  if(cvs.style.left!==left)cvs.style.left=left;
+  if(cvs.style.top!==top)cvs.style.top=top;
+  if(cvs.style.width!==width)cvs.style.width=width;
+  if(cvs.style.height!==height)cvs.style.height=height;
 }
 streamEl.onload=syncCvs;
-document.getElementById('hlsPlayer').addEventListener('loadedmetadata',syncCvs);
+document.getElementById('wsPlayer').addEventListener('loadedmetadata',syncCvs);
 window.addEventListener('resize',syncCvs);
 
 // stream_yolo emits UDP coordinates in the same rotated space as the MJPEG frame.
@@ -1087,14 +1094,14 @@ function applyAll(opts){
   const sr=document.getElementById('senRes').value.split(',');
   cfg.sensor_width=parseInt(sr[0]);
   cfg.sensor_height=parseInt(sr[1]);
-  const hr=document.getElementById('hlsRes');
-  if(hr){
-    const hv=hr.value.split(',');
-    cfg.hls_width =parseInt(hv[0]);
-    cfg.hls_height=parseInt(hv[1]);
+  const wr=document.getElementById('wsRes');
+  if(wr){
+    const wv=wr.value.split(',');
+    cfg.ws_width =parseInt(wv[0]);
+    cfg.ws_height=parseInt(wv[1]);
   }
-  const hf=document.getElementById('hlsFps');
-  if(hf) cfg.hls_fps=parseInt(hf.value);
+  const wf=document.getElementById('wsFps');
+  if(wf) cfg.ws_fps=parseInt(wf.value);
   const rr=document.getElementById('recRes');
   if(rr){
     const rv=rr.value.split(',');
@@ -1150,56 +1157,70 @@ function closeZone(){
 }
 
 // Render loop
+function isZoneEditorActive(){
+  const zoneTab=document.getElementById('main-zone');
+  return !!(zoneTab && zoneTab.classList.contains('active'));
+}
+
 function frame(){
   syncCvs();
   const W=cvs.width,H=cvs.height;
   ctx.clearRect(0,0,W,H);
 
-  // Detection zones (yellow dashed normal; orange when zone 0 is active follower).
-  // While stream_yolo is reporting live _active_zone, zone 0 renders at the
-  // tracked position instead of the config position.
+  const showZones=isZoneEditorActive();
   const sw=cfg.sensor_width||1280, sh=cfg.sensor_height||720;
-  (cfg.detection_zones||[]).forEach((z,i)=>{
-    const isActive=(i===0 && !!cfg.active_detector);
-    const dragging=dzDrag&&dzDrag.idx===i;
-    let zx=z.x, zy=z.y, zs=z.size||INFER_SZ;
-    // Show live position only when active and the user isn't editing.
-    if(isActive && liveActiveZone && !dragging && !dzCfgDirty){
-      zx=liveActiveZone[0]; zy=liveActiveZone[1]; zs=liveActiveZone[2];
-    }
-    const x=zx*W/sw, y=zy*H/sh;
-    const w=zs*W/sw, h=zs*H/sh;
-    const col=isActive?'#ff8800':'#ffcc00';
-    ctx.setLineDash([8,4]);
-    ctx.strokeStyle=dragging?'#ff0':col;
-    ctx.lineWidth=dragging?3:2;
-    ctx.strokeRect(x,y,w,h);
-    ctx.setLineDash([]);
-    ctx.fillStyle=isActive?'rgba(255,136,0,0.10)':'rgba(255,204,0,0.10)';
-    ctx.fillRect(x,y,w,h);
-    // Resize handle (right-bottom corner) -- 32 sensor px -> scale
-    const hsx=Math.max(4, 32*W/sw), hsy=Math.max(4, 32*H/sh);
-    ctx.fillStyle=col;
-    ctx.fillRect(x+w-hsx, y+h-hsy, hsx, hsy);
-    ctx.font='11px monospace';
-    ctx.fillText('zone '+(i+1)+(isActive?' [active]':'')+' ('+zx+','+zy+') sz='+zs, x+4, y+13);
-  });
+  if(showZones){
+    // Detection zones (yellow normal; orange when zone 0 is active follower).
+    // Keep these off the live tab so they do not cover the stream.
+    (cfg.detection_zones||[]).forEach((z,i)=>{
+      const isActive=(i===0 && !!cfg.active_detector);
+      const dragging=dzDrag&&dzDrag.idx===i;
+      let zx=z.x, zy=z.y, zs=z.size||INFER_SZ;
+      // Show live position only when active and the user isn't editing.
+      if(isActive && liveActiveZone && !dragging && !dzCfgDirty){
+        zx=liveActiveZone[0]; zy=liveActiveZone[1]; zs=liveActiveZone[2];
+      }
+      const x=zx*W/sw, y=zy*H/sh;
+      const w=zs*W/sw, h=zs*H/sh;
+      const col=isActive?'#ff8800':'#ffcc00';
+      ctx.setLineDash([]);
+      ctx.strokeStyle=dragging?'#ff0':col;
+      ctx.lineWidth=dragging?3:2;
+      ctx.strokeRect(x,y,w,h);
+      ctx.fillStyle=isActive?'rgba(255,136,0,0.04)':'rgba(255,204,0,0.04)';
+      ctx.fillRect(x,y,w,h);
+      // Resize handle (right-bottom corner) -- 32 sensor px -> scale
+      const hsx=Math.max(4, 32*W/sw), hsy=Math.max(4, 32*H/sh);
+      ctx.fillStyle=col;
+      ctx.fillRect(x+w-hsx, y+h-hsy, hsx, hsy);
+      ctx.font='11px monospace';
+      ctx.fillText('zone '+(i+1)+(isActive?' [active]':'')+' ('+zx+','+zy+') sz='+zs, x+4, y+13);
+    });
+  }
 
-  cfg.zones.forEach((z,i)=>{
-    if(!z.points||z.points.length<2)return;
-    const col=PALETTE[i%PALETTE.length];
-    ctx.beginPath();
-    const[x0,y0]=normToCanvas(z.points[0][0],z.points[0][1]);
-    ctx.moveTo(x0,y0);
-    z.points.slice(1).forEach(p=>{const[x,y]=normToCanvas(p[0],p[1]);ctx.lineTo(x,y);});
-    ctx.closePath();
-    ctx.strokeStyle=col; ctx.lineWidth=2; ctx.stroke();
-    ctx.fillStyle=col+'28'; ctx.fill();
-    ctx.fillStyle=col; ctx.font='11px monospace';
-    ctx.fillText(z.name,x0+3,y0-4);
-    if(!z.enabled){ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fill();}
-  });
-  if(drawing&&drawing.pts.length>0){
+  if(showZones){
+    cfg.zones.forEach((z,i)=>{
+      if(!z.points||z.points.length<2)return;
+      const col=PALETTE[i%PALETTE.length];
+      ctx.beginPath();
+      const[x0,y0]=normToCanvas(z.points[0][0],z.points[0][1]);
+      ctx.moveTo(x0,y0);
+      z.points.slice(1).forEach(p=>{const[x,y]=normToCanvas(p[0],p[1]);ctx.lineTo(x,y);});
+      ctx.closePath();
+      ctx.strokeStyle=col; ctx.lineWidth=2; ctx.stroke();
+      ctx.fillStyle=hexToRgba(col,0.04); ctx.fill();
+      ctx.fillStyle=col; ctx.font='11px monospace';
+      ctx.fillText(z.name,x0+3,y0-4);
+      if(!z.enabled){
+        ctx.strokeStyle='rgba(180,180,180,0.65)';
+        ctx.lineWidth=1;
+        ctx.stroke();
+        ctx.fillStyle='rgba(180,180,180,0.9)';
+        ctx.fillText('disabled',x0+3,y0+10);
+      }
+    });
+  }
+  if(showZones&&drawing&&drawing.pts.length>0){
     ctx.setLineDash([5,4]);
     ctx.strokeStyle='#fff'; ctx.lineWidth=1.5;
     ctx.beginPath();
@@ -1215,14 +1236,24 @@ function frame(){
     });
   }
   const now=Date.now();
-  flashes=flashes.filter(d=>now-d.t<800);
-  flashes.forEach(d=>{
-    const a=1-(now-d.t)/800;
+  const BOX_TTL=750;
+  for(const [k,d] of latestBoxes){
+    if(now-d.t>BOX_TTL)latestBoxes.delete(k);
+  }
+  Array.from(latestBoxes.values())
+    .sort((a,b)=>(a.track_id||0)-(b.track_id||0))
+    .forEach(d=>{
+    const age=now-d.t;
+    const a=age<450?1:Math.max(0,1-(age-450)/(BOX_TTL-450));
     const x1=d.x1/d.fw*W,y1=d.y1/d.fh*H,x2=d.x2/d.fw*W,y2=d.y2/d.fh*H;
     ctx.strokeStyle=`rgba(0,255,0,${a})`; ctx.lineWidth=2;
     ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+    ctx.fillStyle=`rgba(0,0,0,${0.45*a})`;
+    const label=`${d.name} ${(d.score*100).toFixed(0)}%${d.track_id!=null?' #'+d.track_id:''}`;
+    const ly=y1>16?y1-16:y1+2;
+    ctx.fillRect(x1,ly,Math.min(ctx.measureText(label).width+8,W-x1),15);
     ctx.fillStyle=`rgba(0,255,0,${a})`; ctx.font='11px monospace';
-    ctx.fillText(`${d.name} ${(d.score*100).toFixed(0)}%`,x1,y1>14?y1-3:y1+13);
+    ctx.fillText(label,x1+4,ly+11);
   });
   requestAnimationFrame(frame);
 }
@@ -1302,7 +1333,7 @@ function showMainTab(name, btn){
 
 function stopWsLive(){
   if(_wsLivePlayer){ _wsLivePlayer.destroy(); _wsLivePlayer=null; }
-  const v=document.getElementById('hlsPlayer');
+  const v=document.getElementById('wsPlayer');
   v.pause();
   v.removeAttribute('src');
   v.load();
@@ -1395,14 +1426,14 @@ document.addEventListener('visibilitychange', () => {
 function setStream(mode) {
   const ip      = document.getElementById('ip').value.trim();
   const mjpegEl = document.getElementById('stream');
-  const videoEl = document.getElementById('hlsPlayer');
+  const videoEl = document.getElementById('wsPlayer');
   _streamMode = mode;
   if (mode === 'ws') {
     mjpegEl.src = ''; mjpegEl.style.display = 'none';
     videoEl.style.display = 'block';
     stopWsLive();
     const wsUrl = 'ws://' + ip + ':7778/ws/live';
-    _wsLivePlayer = new WsfsLivePlayer(videoEl, wsUrl, cfg.hls_fps || 5);
+    _wsLivePlayer = new WsfsLivePlayer(videoEl, wsUrl, cfg.ws_fps || 5);
     _wsLivePlayer.start();
   } else {
     stopWsLive();
