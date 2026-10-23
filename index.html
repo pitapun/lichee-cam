@@ -11,6 +11,14 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 /* top nav */
 #topnav{display:flex;align-items:stretch;height:46px;background:#141414;border-bottom:1px solid #2a2a2a;padding:0 8px;flex:0 0 auto;gap:0;min-width:0}
 #nav-brand{font-size:11px;letter-spacing:.12em;color:#8cf;font-weight:bold;margin-right:12px;user-select:none;display:flex;align-items:center;flex:0 0 auto}
+*{scrollbar-width:thin;scrollbar-color:#333f4b transparent}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#2b3540;border-radius:5px;border:2px solid transparent;
+  background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:#3e4c5a;background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+#clip-tl-scroll::-webkit-scrollbar{width:7px}
 #nav-tabs{display:flex;height:100%;flex:0 0 auto}
 .nav-tab{padding:0 10px;height:100%;background:transparent;border:0;border-bottom:3px solid transparent;font-family:monospace;font-size:10px;letter-spacing:.08em;color:#555;cursor:pointer;text-transform:uppercase;transition:color .12s;white-space:nowrap}
 .nav-tab:hover{color:#aaa}
@@ -63,8 +71,46 @@ body{font-family:monospace;background:#111;color:#eee;display:flex;flex-directio
 
 /* events tab */
 #main-events{overflow-y:auto;display:none}
+#main-clips{display:none}
+#main-clips.active{display:flex;flex-direction:column;overflow:hidden}
+#clip-body{flex:1;display:flex;min-height:0}
+#clip-stage{flex:1;display:flex;flex-direction:column;min-width:0;background:#000}
+#clip-video-wrap{flex:1;position:relative;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
+#clipPlayer{max-width:100%;max-height:100%;background:#000;display:block}
+#clip-clock{position:absolute;top:10px;right:14px;font-family:monospace;font-size:15px;color:#fff;
+  text-shadow:0 0 5px #000,0 0 5px #000;letter-spacing:.06em;pointer-events:none}
+#clip-nodata{position:absolute;color:#555;font-size:12px}
+#clip-controls{flex:0 0 auto;display:flex;align-items:center;gap:6px;padding:6px 10px;
+  border-top:1px solid #1b1b1b;background:#0e0e0e}
+#clip-controls button{font-family:monospace;font-size:11px;padding:3px 8px;background:#181818;
+  color:#bbb;border:1px solid #2a2a2a;border-radius:3px;cursor:pointer}
+#clip-controls button:hover{background:#222;color:#8cf}
+#clip-controls button[disabled]{opacity:.4;cursor:default}
+.clip-sep{width:1px;height:16px;background:#2a2a2a;margin:0 4px}
+#clipNow{margin-left:12px;font-family:monospace;font-size:11px;color:#666;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px}
+#clip-tl-wrap{flex:0 0 142px;min-width:0;border-left:1px solid #222;background:#0a0a0a;display:flex;flex-direction:column}
+#clip-tl-scroll{flex:1;min-width:0;overflow-y:auto;overflow-x:hidden;position:relative;cursor:ns-resize}
+#clipTl{display:block;width:100%}
+#clip-playhead{position:absolute;left:0;right:0;border-top:2px solid #e33;pointer-events:none;display:none}
+#clip-playhead::after{content:'';position:absolute;right:2px;top:-4px;width:6px;height:6px;
+  background:#e33;border-radius:50%}
+#clip-tl-legend{flex:0 0 auto;display:flex;flex-direction:column;gap:2px;padding:5px 6px 0;
+  font-size:9px;color:#666;font-family:monospace}
+#clip-tl-legend span{display:flex;align-items:center;gap:5px}
+#clip-tl-legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+#clip-tl-zoom{flex:0 0 auto;display:flex;gap:4px;padding:5px;border-top:1px solid #222;justify-content:center}
+#clip-tl-zoom button{font-family:monospace;font-size:11px;width:26px;padding:2px 0;background:#181818;
+  color:#bbb;border:1px solid #2a2a2a;border-radius:3px;cursor:pointer}
+#clipsList{overflow-y:auto;flex:1}
+.clip-row{display:flex;align-items:center;gap:10px;padding:7px 10px;border-bottom:1px solid #1b1b1b;cursor:pointer}
+.clip-row:hover{background:#141414}
+.clip-row.on{background:#16202b}
+.clip-time{font-family:monospace;font-size:12px;color:#8cf;flex:0 0 auto}
+.clip-size{font-family:monospace;font-size:11px;color:#666;margin-left:auto}
+.clip-date{font-size:11px;color:#777}
 #main-events.active{display:block}
-#ev-toolbar{position:sticky;top:0;z-index:2;background:#0e0e0e;border-bottom:1px solid #2a2a2a;padding:8px 16px;display:flex;align-items:center;gap:10px}
+#ev-toolbar,#clip-toolbar{position:sticky;top:0;z-index:2;background:#0e0e0e;border-bottom:1px solid #2a2a2a;padding:8px 16px;display:flex;align-items:center;gap:10px}
 .ev-title{font-size:10px;color:#555;letter-spacing:.1em;text-transform:uppercase;flex:1}
 .ev-count{font-size:11px;color:#555}
 #eventsLeft{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:2px;padding:2px;background:#0a0a0a}
@@ -135,6 +181,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
     <button class="nav-tab active" onclick="showMainTab('live',this)">&#9654; Live</button>
     <button class="nav-tab" onclick="showMainTab('zone',this)">Zone</button>
     <button class="nav-tab" onclick="showMainTab('events',this)">Events</button>
+    <button class="nav-tab" onclick="showMainTab('clips',this)">Clips</button>
     <button class="nav-tab" onclick="showMainTab('settings',this)">Settings</button>
   </div>
   <div id="pipeline-panel">
@@ -239,6 +286,54 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   <div id="eventsLeft"><div class="ev-noresult">No events yet</div></div>
 </div>
 
+<!-- -- Tab: Clips (continuous "dash cam" recording) -- -->
+<div class="main-tab" id="main-clips">
+  <div id="clip-toolbar">
+    <span class="ev-title">Clips</span>
+    <span class="ev-count" id="clipStatus"></span>
+    <button id="clipViewBtn" onclick="toggleClipView()" style="font-size:10px;padding:2px 8px">List</button>
+    <button onclick="loadClips()" style="font-size:10px;padding:2px 8px">Refresh</button>
+  </div>
+  <div id="clip-body">
+    <div id="clip-stage">
+      <div id="clip-video-wrap">
+        <video id="clipPlayer" playsinline muted preload="metadata"></video>
+        <div id="clip-clock"></div>
+        <div id="clip-nodata">No clips yet</div>
+      </div>
+      <div id="clip-controls" title="Keys: left/right +-10s (shift 1min, ctrl 10min), space play/pause, comma/period frame step, [ and ] set export in/out, Home/End oldest/latest, +/- zoom, f fullscreen">
+        <button onclick="clipSkip(-10)" title="back 10s">&#171;10s</button>
+        <button id="clipPlayBtn" onclick="clipTogglePlay()">&#9658;</button>
+        <button onclick="clipSkip(10)" title="forward 10s">10s&#187;</button>
+        <button id="clipRateBtn" onclick="clipCycleRate()">1x</button>
+        <button onclick="clipJumpLatest()">Latest</button>
+        <button onclick="clipFullscreen()" title="fullscreen">&#9974;</button>
+        <span class="clip-sep"></span>
+        <button onclick="clipMarkIn()" title="export starts here">[ In</button>
+        <button onclick="clipMarkOut()" title="export ends here">Out ]</button>
+        <button id="clipExportBtn" onclick="clipExport()" disabled>Export</button>
+        <button onclick="clipClearMarks()" title="clear selection">&#10005;</button>
+        <span id="clipNow"></span>
+      </div>
+    </div>
+    <div id="clip-tl-wrap">
+      <div id="clip-tl-scroll">
+        <canvas id="clipTl" width="1" height="1"></canvas>
+        <div id="clip-playhead"></div>
+      </div>
+      <div id="clip-tl-legend">
+        <span><i style="background:#ff9d1f"></i>person</span>
+        <span><i style="background:#3aa6ff"></i>vehicle</span>
+      </div>
+      <div id="clip-tl-zoom">
+        <button onclick="clipZoom(0.5)">&#8722;</button>
+        <button onclick="clipZoom(2)">+</button>
+      </div>
+    </div>
+  </div>
+  <div id="clipsList" style="display:none"></div>
+</div>
+
 <!-- lightbox -->
 <div id="ev-lightbox">
   <button id="ev-lb-close" onclick="closeLightbox()">x</button>
@@ -331,7 +426,14 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
   </div>
 
   <div class="s-section">
-    <h2>WS stream</h2>
+    <h2>Live + clip recording</h2>
+    <div class="s-row">
+      <span class="s-label"></span>
+      <span style="flex:1;font-size:10px;color:#666;line-height:1.5">
+        Clips are recorded from this stream, so this is the recording quality.
+        Higher fps costs CPU and card space. Takes effect on <b>Apply &amp; Reboot</b>.
+      </span>
+    </div>
     <div class="s-row">
       <span class="s-label">Resolution</span>
       <select id="wsRes" style="flex:1">
@@ -343,7 +445,7 @@ button.act{background:#1a3a1a;border-color:#4a8a4a;color:#8f8}
       </select>
     </div>
     <div class="s-row">
-      <span class="s-label">FPS</span>
+      <span class="s-label">Record fps</span>
       <input type="range" id="wsFps" min="1" max="30" step="1" value="5" style="flex:1"
              oninput="document.getElementById('wsFpsv').textContent=this.value">
       <span id="wsFpsv" style="width:32px;text-align:right">5</span>
@@ -566,6 +668,398 @@ function loadEvents(){
     }).catch(()=>{
       if(countEl) countEl.textContent='failed';
     });
+}
+
+// ---- Clips: Frigate-style recording timeline ------------------------------
+// The clips are independent 10-minute mp4s, but the user thinks in wall-clock
+// time, so everything below maps an instant -> (clip, offset) and back.
+let _clips=[];            // ascending by start, each {started,duration,end,url,size}
+let _clipMarks=[];        // detection marks {t,cat,d}
+let _clipIdx=-1;          // index into _clips currently loaded
+let _tlPx=0.08;           // pixels per second of timeline (1h = 288px)
+let _tlDragging=false;
+let _tlUserScrolled=0;    // timestamp of last manual scroll, suppresses auto-follow
+let _clipRate=1;
+let _clipView='timeline';
+let _clipStore={};
+let _expIn=null,_expOut=null;
+const CLIP_RATES=[1,2,4,8];
+
+function clipEl(){return document.getElementById('clipPlayer');}
+function clipSpan(){
+  if(!_clips.length)return[0,0];
+  return[_clips[0].started,_clips[_clips.length-1].end];
+}
+function clipFmtTime(t){
+  const d=new Date(t*1000);
+  return d.toLocaleTimeString('en-GB',{hour12:false});
+}
+function clipFmtFull(t){
+  const d=new Date(t*1000);
+  return d.toLocaleDateString('en-CA')+'  '+d.toLocaleTimeString('en-GB',{hour12:false});
+}
+
+function loadClips(){
+  const statEl=document.getElementById('clipStatus');
+  if(!ip)return;
+  const since=Math.floor(Date.now()/1000)-36*3600;
+  Promise.all([
+    fetch('http://'+ip+':7778/api/clips').then(r=>r.json()),
+    fetch('http://'+ip+':7778/api/clip-marks?since='+since).then(r=>r.json()).catch(()=>[])
+  ]).then(([info,marks])=>{
+    _clips=(info.clips||[]).slice().sort((a,b)=>a.started-b.started);
+    _clipMarks=Array.isArray(marks)?marks:[];
+    const hours=_clips.length?((clipSpan()[1]-clipSpan()[0])/3600):0;
+    _clipStore=info.storage||{};
+    if(statEl){
+      const st=_clipStore;
+      let txt=_clips.length+' clips - '+hours.toFixed(1)+'h - clips '+
+        (info.used_gb||0).toFixed(1)+'/'+(info.max_gb||0).toFixed(0)+' GB';
+      if(st.events_gb!=null)txt+=' - events '+st.events_gb.toFixed(1)+'/'+
+        (st.events_max_gb||0).toFixed(1)+' GB';
+      if(st.disk_free_gb!=null)txt+=' - card '+st.disk_free_gb.toFixed(1)+
+        ' GB free of '+(st.disk_total_gb||0).toFixed(0);
+      if(st.hours_left!=null)txt+=' (~'+st.hours_left+'h more)';
+      if(info.recording)txt+=' - REC';
+      if(info.pending_remux)txt+=' - '+info.pending_remux+' converting';
+      statEl.textContent=txt;
+    }
+    document.getElementById('clip-nodata').style.display=_clips.length?'none':'block';
+    renderClipList();
+    drawTimeline();
+    if(_clipIdx<0&&_clips.length)clipJumpLatest();
+    else positionPlayhead();
+  }).catch(()=>{if(statEl)statEl.textContent='failed';});
+}
+
+// ---- time <-> clip ----
+function clipIndexAt(t){
+  for(let i=0;i<_clips.length;i++){
+    if(t>=_clips[i].started&&t<_clips[i].end)return i;
+  }
+  return -1;
+}
+function clipSeekTime(t,play){
+  if(!_clips.length)return;
+  let i=clipIndexAt(t);
+  if(i<0){
+    // Between clips (a restart gap) or off the ends: snap into the nearest.
+    i=t<_clips[0].started?0:_clips.length-1;
+    for(let k=0;k<_clips.length;k++){if(_clips[k].started>t){i=k;break;}}
+    t=Math.min(Math.max(t,_clips[i].started),_clips[i].end-0.3);
+  }
+  const off=Math.max(0,Math.min(t-_clips[i].started,_clips[i].duration-0.2));
+  const v=clipEl();
+  if(i!==_clipIdx){
+    _clipIdx=i;
+    v.src='http://'+ip+':7778'+_clips[i].url;
+    const onMeta=()=>{v.removeEventListener('loadedmetadata',onMeta);
+      try{v.currentTime=off;}catch(e){}
+      v.playbackRate=_clipRate;
+      if(play!==false)v.play().catch(()=>{});};
+    v.addEventListener('loadedmetadata',onMeta);
+    v.load();
+    renderClipList();
+  }else{
+    try{v.currentTime=off;}catch(e){}
+    if(play!==false)v.play().catch(()=>{});
+  }
+  updateClipClock();
+}
+function clipNowTime(){
+  if(_clipIdx<0||!_clips[_clipIdx])return null;
+  return _clips[_clipIdx].started+(clipEl().currentTime||0);
+}
+
+// ---- controls ----
+function clipSkip(sec){
+  const t=clipNowTime();
+  if(t==null)return;
+  clipSeekTime(t+sec,!clipEl().paused);
+}
+function clipTogglePlay(){
+  const v=clipEl();
+  if(!v.src&&_clips.length){clipJumpLatest();return;}
+  if(v.paused)v.play().catch(()=>{});else v.pause();
+}
+function clipCycleRate(){
+  _clipRate=CLIP_RATES[(CLIP_RATES.indexOf(_clipRate)+1)%CLIP_RATES.length];
+  clipEl().playbackRate=_clipRate;
+  document.getElementById('clipRateBtn').textContent=_clipRate+'x';
+}
+function clipJumpLatest(){
+  if(!_clips.length)return;
+  const last=_clips[_clips.length-1];
+  clipSeekTime(Math.max(last.started,last.end-30),true);
+}
+function clipFullscreen(){
+  const w=document.getElementById('clip-video-wrap');
+  if(document.fullscreenElement)document.exitFullscreen();
+  else if(w.requestFullscreen)w.requestFullscreen();
+}
+function toggleClipView(){
+  _clipView=_clipView==='timeline'?'list':'timeline';
+  const tl=_clipView==='timeline';
+  document.getElementById('clip-body').style.display=tl?'flex':'none';
+  document.getElementById('clipsList').style.display=tl?'none':'block';
+  document.getElementById('clipViewBtn').textContent=tl?'List':'Timeline';
+  if(tl)drawTimeline();
+}
+
+// ---- timeline ----
+function clipZoom(f){
+  _tlPx=Math.max(0.01,Math.min(2,_tlPx*f));
+  drawTimeline();
+  positionPlayhead(true);
+}
+function tlLabelStep(){
+  // Aim for a label roughly every 64px, snapped to a human interval.
+  const want=64/_tlPx;
+  const steps=[60,120,300,600,900,1800,3600,7200,10800,21600,43200];
+  for(const st of steps)if(st>=want)return st;
+  return 86400;
+}
+const MARK_X=4, MARK_W=22;
+function clipMarkColor(cat){
+  return cat==='person'?'#ff9d1f':(cat==='vehicle'?'#3aa6ff':(cat==='animal'?'#7ad17a':'#b8a06a'));
+}
+function clipMarkNear(t,tolSec){
+  let best=null,bd=tolSec;
+  _clipMarks.forEach(m=>{
+    const d=Math.abs(m.t-t);
+    if(d<bd){bd=d;best=m;}
+  });
+  return best;
+}
+function drawTimeline(){
+  const cv=document.getElementById('clipTl');
+  const wrap=document.getElementById('clip-tl-scroll');
+  if(!cv||!wrap)return;
+  const [t0,t1]=clipSpan();
+  const w=wrap.clientWidth||108;
+  const h=Math.max(160,Math.round((t1-t0)*_tlPx));
+  const dpr=window.devicePixelRatio||1;
+  cv.style.width=w+'px';cv.style.height=h+'px';
+  cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);
+  const g=cv.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,w,h);
+  if(t1<=t0)return;
+  const y=t=>(t1-t)*_tlPx;   // newest at the top, like Frigate
+  // recorded coverage
+  g.fillStyle='#20303f';
+  _clips.forEach(c=>{
+    const yy=y(c.end);
+    g.fillRect(w-14,yy,8,Math.max(1,c.duration*_tlPx));
+  });
+  // gridlines + labels (labels sit right of the event-mark column)
+  const step=tlLabelStep();
+  g.font='9px monospace';
+  g.textAlign='left';
+  const first=Math.ceil(t0/step)*step;
+  for(let t=first;t<=t1;t+=step){
+    const yy=Math.round(y(t))+0.5;
+    g.strokeStyle='#1e1e1e';g.lineWidth=1;
+    g.beginPath();g.moveTo(MARK_X+MARK_W+2,yy);g.lineTo(w,yy);g.stroke();
+    g.fillStyle='#666';
+    g.fillText(clipFmtTime(t),MARK_X+MARK_W+6,yy-3);
+  }
+  // export selection
+  if(_expIn!=null&&_expOut!=null&&_expOut>_expIn){
+    g.fillStyle='rgba(140,204,255,0.16)';
+    g.fillRect(0,y(_expOut),w,(_expOut-_expIn)*_tlPx);
+    g.strokeStyle='#8cf';g.lineWidth=1;
+    [_expIn,_expOut].forEach(t=>{
+      const yy=Math.round(y(t))+0.5;
+      g.beginPath();g.moveTo(0,yy);g.lineTo(w,yy);g.stroke();
+    });
+  }
+  // detection marks — their own column, always thick enough to see
+  g.fillStyle='#111';
+  g.fillRect(MARK_X,0,MARK_W,h);
+  _clipMarks.forEach(m=>{
+    if(m.t<t0||m.t>t1)return;
+    const yy=y(m.t);
+    const len=Math.max(4,(m.d||1)*_tlPx);
+    g.fillStyle=clipMarkColor(m.cat);
+    g.fillRect(MARK_X,yy-len,MARK_W,len);
+  });
+}
+function positionPlayhead(force){
+  const ph=document.getElementById('clip-playhead');
+  const wrap=document.getElementById('clip-tl-scroll');
+  const t=clipNowTime();
+  const [t0,t1]=clipSpan();
+  if(t==null||t1<=t0){ph.style.display='none';return;}
+  const yy=(t1-t)*_tlPx;
+  ph.style.display='block';
+  ph.style.top=yy+'px';
+  // follow the playhead unless the user is driving the scrollbar
+  if(force||(!_tlDragging&&Date.now()-_tlUserScrolled>4000)){
+    const view=wrap.clientHeight;
+    if(yy<wrap.scrollTop+20||yy>wrap.scrollTop+view-20)
+      wrap.scrollTop=Math.max(0,yy-view/2);
+  }
+}
+function tlTimeFromEvent(e){
+  const wrap=document.getElementById('clip-tl-scroll');
+  const r=wrap.getBoundingClientRect();
+  const cy=(e.touches&&e.touches[0]?e.touches[0].clientY:e.clientY);
+  const yy=(cy-r.top)+wrap.scrollTop;
+  const [t0,t1]=clipSpan();
+  return t1-yy/_tlPx;
+}
+function updateClipClock(){
+  const t=clipNowTime();
+  const clock=document.getElementById('clip-clock');
+  const now=document.getElementById('clipNow');
+  if(t==null){clock.textContent='';if(now)now.textContent='';return;}
+  clock.textContent=clipFmtFull(t);
+  if(now&&_clips[_clipIdx])
+    now.textContent=(_clipIdx+1)+'/'+_clips.length+'  '+_clips[_clipIdx].name;
+  positionPlayhead();
+}
+
+function renderClipList(){
+  const listEl=document.getElementById('clipsList');
+  if(!listEl)return;
+  if(!_clips.length){
+    listEl.innerHTML='<div class="ev-noresult">No clips yet</div>';
+    return;
+  }
+  listEl.innerHTML='';
+  _clips.slice().reverse().forEach(c=>{
+    const t=new Date(c.started*1000);
+    const row=document.createElement('div');
+    row.className='clip-row'+(_clips[_clipIdx]&&_clips[_clipIdx].name===c.name?' on':'');
+    row.innerHTML='<span class="clip-time">'+
+      t.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false})+'</span>'+
+      '<span class="clip-date">'+t.toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</span>'+
+      '<span class="clip-size">'+Math.round(c.duration/60)+' min - '+
+      (c.size/1048576).toFixed(0)+' MB</span>';
+    row.onclick=()=>{if(_clipView==='list')toggleClipView();clipSeekTime(c.started+1,true);};
+    listEl.appendChild(row);
+  });
+}
+
+// ---- export: mark in/out on the timeline, then stream it down ----
+function clipMarkIn(){
+  const t=clipNowTime();
+  if(t==null)return;
+  _expIn=t;
+  if(_expOut!=null&&_expOut<=_expIn)_expOut=null;
+  clipUpdateExport();
+}
+function clipMarkOut(){
+  const t=clipNowTime();
+  if(t==null)return;
+  _expOut=t;
+  if(_expIn!=null&&_expIn>=_expOut)_expIn=null;
+  clipUpdateExport();
+}
+function clipClearMarks(){_expIn=null;_expOut=null;clipUpdateExport();}
+function clipBytesPerSec(){
+  let sz=0,sec=0;
+  _clips.forEach(c=>{sz+=c.size||0;sec+=c.duration||0;});
+  return sec>60?sz/sec:230000;
+}
+function clipUpdateExport(){
+  const btn=document.getElementById('clipExportBtn');
+  const ok=_expIn!=null&&_expOut!=null&&_expOut-_expIn>=2;
+  btn.disabled=!ok;
+  if(ok){
+    const span=_expOut-_expIn;
+    const mb=span*clipBytesPerSec()/1048576;
+    btn.textContent='Export '+(span<90?Math.round(span)+'s':Math.round(span/60)+'m')+
+      ' ~'+(mb<1024?Math.round(mb)+' MB':(mb/1024).toFixed(1)+' GB');
+  }else{
+    btn.textContent=_expIn!=null?'Export (set Out)':(_expOut!=null?'Export (set In)':'Export');
+  }
+  drawTimeline();
+}
+function clipExport(){
+  if(_expIn==null||_expOut==null||_expOut<=_expIn)return;
+  const span=_expOut-_expIn;
+  if(span>3600){alert('Export is capped at 1 hour.');return;}
+  const tz=-new Date().getTimezoneOffset();   // so the filename is in your local time
+  const url='http://'+ip+':7778/api/export.mp4?from='+_expIn.toFixed(0)+
+    '&to='+_expOut.toFixed(0)+'&tz='+tz;
+  const a=document.createElement('a');
+  a.href=url;a.download='';
+  document.body.appendChild(a);a.click();a.remove();
+  setStatus('Export started - the device copies about 10x realtime');
+}
+
+function clipKeyHandler(e){
+  // only while the Clips tab is up, and never while typing into a field
+  if(!document.getElementById('main-clips').classList.contains('active'))return;
+  const tgt=e.target;
+  if(tgt&&typeof tgt.matches==='function'&&tgt.matches('input,select,textarea,[contenteditable]'))return;
+  const big=e.shiftKey, huge=e.ctrlKey||e.metaKey;
+  const step=huge?600:(big?60:10);
+  let handled=true;
+  switch(e.key){
+    case 'ArrowLeft': case 'ArrowDown':  clipSkip(-step); break;
+    case 'ArrowRight': case 'ArrowUp':   clipSkip(step); break;
+    case ' ': case 'k':                  clipTogglePlay(); break;
+    case 'j':                            clipSkip(-30); break;
+    case 'l':                            clipSkip(30); break;
+    case ',':                            clipStepFrame(-1); break;
+    case '.':                            clipStepFrame(1); break;
+    case '[':                            clipMarkIn(); break;
+    case ']':                            clipMarkOut(); break;
+    case 'Home':                         if(_clips.length)clipSeekTime(_clips[0].started+0.2,true); break;
+    case 'End':                          clipJumpLatest(); break;
+    case '+': case '=':                  clipZoom(2); break;
+    case '-': case '_':                  clipZoom(0.5); break;
+    case 'f':                            clipFullscreen(); break;
+    default: handled=false;
+  }
+  if(handled){e.preventDefault();e.stopPropagation();}
+}
+function clipStepFrame(dir){
+  const c=_clips[_clipIdx];
+  const fps=(c&&c.fps)||10;
+  const v=clipEl();
+  if(!v.paused)v.pause();
+  clipSkip(dir/fps);
+}
+
+function initClipPlayer(){
+  const v=clipEl();
+  if(!v||v._wired)return;
+  v._wired=true;
+  window.addEventListener('keydown',clipKeyHandler);
+  v.addEventListener('timeupdate',updateClipClock);
+  v.addEventListener('play',()=>{document.getElementById('clipPlayBtn').innerHTML='&#10074;&#10074;';});
+  v.addEventListener('pause',()=>{document.getElementById('clipPlayBtn').innerHTML='&#9658;';});
+  v.addEventListener('ended',()=>{
+    // roll straight into the next segment so the hour plays as one recording
+    if(_clipIdx+1<_clips.length)clipSeekTime(_clips[_clipIdx+1].started+0.05,true);
+  });
+  const wrap=document.getElementById('clip-tl-scroll');
+  wrap.addEventListener('scroll',()=>{if(!_tlDragging)_tlUserScrolled=Date.now();});
+  const down=e=>{
+    _tlDragging=true;
+    let t=tlTimeFromEvent(e);
+    const m=clipMarkNear(t,10/_tlPx);   // within ~10px of a detection: snap to it
+    if(m)t=m.t-2;
+    clipSeekTime(t,false);
+    e.preventDefault();
+  };
+  const move=e=>{if(_tlDragging){clipSeekTime(tlTimeFromEvent(e),false);e.preventDefault();}};
+  const up=()=>{if(_tlDragging){_tlDragging=false;clipEl().play().catch(()=>{});}};
+  wrap.addEventListener('mousedown',down);
+  window.addEventListener('mousemove',move);
+  window.addEventListener('mouseup',up);
+  wrap.addEventListener('touchstart',down,{passive:false});
+  wrap.addEventListener('touchmove',move,{passive:false});
+  wrap.addEventListener('touchend',up);
+}
+
+function stopClipPlayback(){
+  const v=clipEl();
+  if(v&&!v.paused)v.pause();
 }
 
 function openLightbox(e){
@@ -1306,6 +1800,7 @@ function setStatus(msg){
 }
 
 function showMainTab(name, btn){
+  const wasClips = document.getElementById('main-clips').classList.contains('active');
   const isVideoTab = name==='live' || name==='zone';
   const wasVideoTab =
     document.getElementById('main-live').classList.contains('active') ||
@@ -1321,6 +1816,9 @@ function showMainTab(name, btn){
     requestAnimationFrame(syncCvs);
   }
   if(name==='events') loadEvents();
+  if(name==='clips'){ initClipPlayer(); loadClips(); requestAnimationFrame(()=>{drawTimeline();positionPlayhead(true);}); }
+  // leaving Clips: stop the download, a 10-min mp4 keeps pulling otherwise
+  if(wasClips && name!=='clips') stopClipPlayback();
   // leaving video tabs: tear down live video so buffers don't accumulate
   if(wasVideoTab && !isVideoTab && _streamMode==='ws') {
     stopWsLive();

@@ -13,6 +13,7 @@ Current docs:
 - `LIVE_STREAM.md`: WS live endpoint, WSFS packet format, JMuxer, checks.
 - `UI_OVERLAYS.md`: live/zone tab overlay rules and flicker prevention.
 - `EVENT_RECORDING.md`: event lifecycle, stop policy, stationary suppression.
+- `CONTINUOUS_RECORDING.md`: rolling dash-cam clips, storage budgets, `/api/clips`.
 - `PERFORMANCE_AND_TUNING.md`: resolution/fps roles and tuning order.
 - `OPERATIONS.md`: deploy, health checks, memory checks, external Frigate note.
 - `BUILD.md`: cross-compilation.

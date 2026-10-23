@@ -1,0 +1,16 @@
+--- /home/thylation/Desktop/lichee-cam/patches/capture_cvi.h.orig	2026-06-09 14:51:07.765013635 +0930
++++ /home/thylation/Desktop/lichee-cam/patches/capture_cvi.h.patched	2026-06-09 14:51:07.722208037 +0930
+@@ -38,7 +38,12 @@
+ 
+     int start_streaming();
+ 
+-    int read_frame(unsigned char* bgrdata);
++    int read_frame(unsigned char* bgrdata, bool retain_image_ptr = false);
++
++    void* getImagePtr();
++    void* getImagePtr2();
++    void* getOriginalImagePtr();
++    void releaseImagePtr();
+ 
+     int stop_streaming();
+ 

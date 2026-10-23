@@ -1,0 +1,904 @@
+--- patches/capture_cvi.cpp.orig	2026-06-09 14:18:54.153847013 +0930
++++ patches/capture_cvi.cpp.patched	2026-06-16 21:01:19.822152635 +0930
+@@ -696,6 +696,19 @@
+     CVI_U32 u32PoolId;
+ } VIDEO_FRAME_INFO_S;
+ 
++typedef enum _VI_DUMP_TYPE_E {
++   VI_DUMP_TYPE_RAW = 0,
++   VI_DUMP_TYPE_YUV = 1,
++   VI_DUMP_TYPE_IR = 2,
++   VI_DUMP_TYPE_BUTT
++} VI_DUMP_TYPE_E;
++
++typedef struct _VI_DUMP_ATTR_S {
++   CVI_BOOL bEnable; /* RW;Whether dump is enable */
++   CVI_U32 u32Depth; /* RW;Range [0,8];Depth */
++   VI_DUMP_TYPE_E enDumpType;
++} VI_DUMP_ATTR_S;
++
+ typedef CVI_S32 (*PFN_CVI_VI_SetDevAttr)(VI_DEV ViDev, const VI_DEV_ATTR_S *pstDevAttr);
+ typedef CVI_S32 (*PFN_CVI_VI_EnableDev)(VI_DEV ViDev);
+ typedef CVI_S32 (*PFN_CVI_VI_DisableDev)(VI_DEV ViDev);
+@@ -711,7 +724,10 @@
+ typedef CVI_S32 (*PFN_CVI_VI_DisableChn)(VI_PIPE ViPipe, VI_CHN ViChn);
+ typedef CVI_S32 (*PFN_CVI_VI_SetChnCrop)(VI_PIPE ViPipe, VI_CHN ViChn, const VI_CROP_INFO_S  *pstCropInfo);
+ typedef CVI_S32 (*PFN_CVI_VI_GetChnFrame)(VI_PIPE ViPipe, VI_CHN ViChn, VIDEO_FRAME_INFO_S *pstFrameInfo, CVI_S32 s32MilliSec);
++typedef CVI_S32 (*PFN_CVI_VI_GetPipeFrame)(VI_PIPE ViPipe, VIDEO_FRAME_INFO_S *pstFrameInfo, CVI_S32 s32MilliSec);
++typedef CVI_S32 (*PFN_CVI_VI_SetPipeDumpAttr)(VI_PIPE ViPipe, const VI_DUMP_ATTR_S *pstDumpAttr);
+ typedef CVI_S32 (*PFN_CVI_VI_ReleaseChnFrame)(VI_PIPE ViPipe, VI_CHN ViChn, const VIDEO_FRAME_INFO_S *pstFrameInfo);
++typedef CVI_S32 (*PFN_CVI_VI_ReleasePipeFrame)(VI_PIPE ViPipe, const VIDEO_FRAME_INFO_S *pstVideoFrame);
+ }
+ 
+ extern "C"
+@@ -806,6 +822,7 @@
+ typedef CVI_S32 (*PFN_CVI_VPSS_GetChnAttr)(VPSS_GRP VpssGrp, VPSS_CHN VpssChn, VPSS_CHN_ATTR_S* pstChnAttr);
+ typedef CVI_S32 (*PFN_CVI_VPSS_GetChnFrame)(VPSS_GRP VpssGrp, VPSS_CHN VpssChn, VIDEO_FRAME_INFO_S* pstVideoFrame, CVI_S32 s32MilliSec);
+ typedef CVI_S32 (*PFN_CVI_VPSS_ReleaseChnFrame)(VPSS_GRP VpssGrp, VPSS_CHN VpssChn, const VIDEO_FRAME_INFO_S* pstVideoFrame);
++typedef CVI_S32 (*PFN_CVI_VI_ReleasePipeFrame)(VI_PIPE ViPipe, const VIDEO_FRAME_INFO_S *pstVideoFrame);
+ typedef CVI_S32 (*PFN_CVI_VPSS_ResetGrp)(VPSS_GRP VpssGrp);
+ typedef CVI_S32 (*PFN_CVI_VPSS_SendFrame)(VPSS_GRP VpssGrp, const VIDEO_FRAME_INFO_S* pstVideoFrame, CVI_S32 s32MilliSec);
+ typedef CVI_S32 (*PFN_CVI_VPSS_SetChnAttr)(VPSS_GRP VpssGrp, VPSS_CHN VpssChn, const VPSS_CHN_ATTR_S* pstChnAttr);
+@@ -840,7 +857,10 @@
+ static PFN_CVI_VI_DisableChn CVI_VI_DisableChn = 0;
+ static PFN_CVI_VI_SetChnCrop CVI_VI_SetChnCrop = 0;
+ static PFN_CVI_VI_GetChnFrame CVI_VI_GetChnFrame = 0;
++static PFN_CVI_VI_GetPipeFrame CVI_VI_GetPipeFrame = 0;
++static PFN_CVI_VI_SetPipeDumpAttr CVI_VI_SetPipeDumpAttr = 0;
+ static PFN_CVI_VI_ReleaseChnFrame CVI_VI_ReleaseChnFrame = 0;
++static PFN_CVI_VI_ReleasePipeFrame CVI_VI_ReleasePipeFrame = 0;
+ 
+ static PFN_CVI_VPSS_AttachVbPool CVI_VPSS_AttachVbPool = 0;
+ static PFN_CVI_VPSS_CreateGrp CVI_VPSS_CreateGrp = 0;
+@@ -924,7 +944,10 @@
+     CVI_VI_DisableChn = 0;
+     CVI_VI_SetChnCrop = 0;
+     CVI_VI_GetChnFrame = 0;
++    CVI_VI_GetPipeFrame = 0;
++    CVI_VI_SetPipeDumpAttr = 0;
+     CVI_VI_ReleaseChnFrame = 0;
++    CVI_VI_ReleasePipeFrame = 0;
+ 
+     CVI_VPSS_AttachVbPool = 0;
+     CVI_VPSS_CreateGrp = 0;
+@@ -1061,7 +1084,10 @@
+     CVI_VI_DisableChn = (PFN_CVI_VI_DisableChn)dlsym(libvpu, "CVI_VI_DisableChn");
+     CVI_VI_SetChnCrop = (PFN_CVI_VI_SetChnCrop)dlsym(libvpu, "CVI_VI_SetChnCrop");
+     CVI_VI_GetChnFrame = (PFN_CVI_VI_GetChnFrame)dlsym(libvpu, "CVI_VI_GetChnFrame");
++    CVI_VI_GetPipeFrame = (PFN_CVI_VI_GetPipeFrame)dlsym(libvpu, "CVI_VI_GetPipeFrame");
++    CVI_VI_SetPipeDumpAttr = (PFN_CVI_VI_SetPipeDumpAttr)dlsym(libvpu, "CVI_VI_SetPipeDumpAttr");
+     CVI_VI_ReleaseChnFrame = (PFN_CVI_VI_ReleaseChnFrame)dlsym(libvpu, "CVI_VI_ReleaseChnFrame");
++    CVI_VI_ReleasePipeFrame = (PFN_CVI_VI_ReleasePipeFrame)dlsym(libvpu, "CVI_VI_ReleasePipeFrame");
+ 
+     CVI_VPSS_AttachVbPool = (PFN_CVI_VPSS_AttachVbPool)dlsym(libvpu, "CVI_VPSS_AttachVbPool");
+     CVI_VPSS_CreateGrp = (PFN_CVI_VPSS_CreateGrp)dlsym(libvpu, "CVI_VPSS_CreateGrp");
+@@ -1876,15 +1902,8 @@
+         // licheerv nano
+         libsns_obj = dlopen("libsns_gc4653.so", RTLD_LOCAL | RTLD_NOW);
+         if (!libsns_obj)
+-        {
+             libsns_obj = dlopen("/mnt/system/lib/libsns_gc4653.so", RTLD_LOCAL | RTLD_NOW);
+-        }
+-        if (!libsns_obj)
+-        {
+-            fprintf(stderr, "%s\n", dlerror());
+-            goto OUT;
+-        }
+-
++        if (!libsns_obj) { fprintf(stderr, "%s\n", dlerror()); goto OUT; }
+         pstSnsObj = (ISP_SNS_OBJ_S*)dlsym(libsns_obj, "stSnsGc4653_Obj");
+     }
+     else
+@@ -2542,12 +2561,15 @@
+     }
+     if (device_model == 3)
+     {
+-        // licheerv nano
++        // licheerv nano. Lane mapping {4,3,2} matches the Sipeed LicheeRV
++        // Nano CSI connector wiring used by Pita's boards; upstream nihui
++        // default {2,1,0} causes the kernel VI driver to return c00e8040
++        // (Operation not permitted) because no data arrives.
+         static const struct sns_ini_cfg lpirvnano = {
+             4,  // bus_id
+             29, // sns_i2c_addr
+             0,  // mipi_dev
+-            {4, 3, 2, -1, -1},  // lane_id
++            {4, 3, 2, -1, -1},  // lane_id  (was upstream {2,1,0})
+             {0, 0, 0, 0, 0},    // pn_swap
+             true,   // mclk_en
+             0       // mclk
+@@ -2647,12 +2669,20 @@
+ 
+     int start_streaming();
+ 
+-    int read_frame(unsigned char* bgrdata);
++    int read_frame(unsigned char* bgrdata, bool retain_image_ptr);
++    void* read_frame_raw();
+ 
+     int stop_streaming();
+ 
+     int close();
+ 
++    //added by jj
++    void* getImagePtr();
++    void* getImagePtr2();
++    void* getOriginalImagePtr();
++    void* getVpssFramePtr();
++    void releaseImagePtr(); //will release image_ptr, image_ptr2, and original_image_ptr
++
+ public:
+     int crop_width;
+     int crop_height;
+@@ -2703,12 +2733,34 @@
+     int b_vpss_vbpool_attached = 0;
+     int b_vpss_grp_started = 0;
+     int b_vpss_frame_got = 0;
++    int b_vi_pipe_frame_got = 0;
+ 
+-    VPSS_GRP VpssGrp = 0;
++    VPSS_GRP VpssGrp = 2;
+     // VPSS_GRP VpssGrp = CVI_VPSS_GetAvailableGrp();
+     VPSS_CHN VpssChn = VPSS_CHN0;
+     VIDEO_FRAME_INFO_S stFrameInfo_bgr;
+ 
++    // infer channel (CHN1): 640x640 RGB_888_PLANAR, left-half crop, for TDL SDK
++    VB_POOL VbPool2 = VB_INVALID_POOLID;
++    int b_vb_pool2_created = 0;
++    int b_vpss_chn1_enabled = 0;
++    int b_vpss_chn1_vbpool_attached = 0;
++    int b_vpss_infer_frame_got = 0;
++    VIDEO_FRAME_INFO_S stFrameInfo_infer;
++
++    // infer channel 2 (CHN2): 640x640 RGB_888_PLANAR, right-half crop
++    VB_POOL VbPool3 = VB_INVALID_POOLID;
++    int b_vb_pool3_created = 0;
++    int b_vpss_chn2_enabled = 0;
++    int b_vpss_chn2_vbpool_attached = 0;
++    int b_vpss_infer2_frame_got = 0;
++    VIDEO_FRAME_INFO_S stFrameInfo_infer2;
++
++private:
++    //added by jj
++    void* image_ptr;
++    void* image_ptr2;
++    void* original_image_ptr;
+ };
+ 
+ capture_cvi_impl::capture_cvi_impl()
+@@ -2757,9 +2809,23 @@
+     b_vpss_grp_started = 0;
+     b_vpss_frame_got = 0;
+ 
+-    VpssGrp = 0;
++    VpssGrp = 2;
+     // VpssGrp = CVI_VPSS_GetAvailableGrp();
+     VpssChn = VPSS_CHN0;
++    //added by jj
++    image_ptr = nullptr;
++    image_ptr2 = nullptr;
++    original_image_ptr = nullptr;
++    VbPool2 = VB_INVALID_POOLID;
++    b_vb_pool2_created = 0;
++    b_vpss_chn1_enabled = 0;
++    b_vpss_chn1_vbpool_attached = 0;
++    b_vpss_infer_frame_got = 0;
++    VbPool3 = VB_INVALID_POOLID;
++    b_vb_pool3_created = 0;
++    b_vpss_chn2_enabled = 0;
++    b_vpss_chn2_vbpool_attached = 0;
++    b_vpss_infer2_frame_got = 0;
+ }
+ 
+ capture_cvi_impl::~capture_cvi_impl()
+@@ -2771,7 +2837,9 @@
+ {
+     const CVI_U16 cap_width = get_sensor_cfg()->cap_width;
+     const CVI_U16 cap_height = get_sensor_cfg()->cap_height;
+-    const float cap_fps = get_sensor_cfg()->cap_fps;
++    // Honour user-supplied fps via CAP_PROP_FPS, else fall back to sensor default.
++    const float cap_fps = (fps > 0.5f) ? fps : get_sensor_cfg()->cap_fps;
++    fprintf(stderr, "[cvi] capture fps=%.1f\n", cap_fps);
+     const WDR_MODE_E cap_wdr_mode = get_sensor_cfg()->cap_wdr_mode;
+     const BAYER_FORMAT_E cap_bayer_format = get_sensor_cfg()->cap_bayer_format;
+     const ISP_BAYER_FORMAT_E isp_bayer_format = get_sensor_cfg()->isp_bayer_format;
+@@ -2857,7 +2925,7 @@
+         VB_CONFIG_S stVbConfig;
+         stVbConfig.u32MaxPoolCnt = 1;
+         stVbConfig.astCommPool[0].u32BlkSize = yuv_buffer_size;
+-        stVbConfig.astCommPool[0].u32BlkCnt = 4;
++        stVbConfig.astCommPool[0].u32BlkCnt = 8;
+         stVbConfig.astCommPool[0].enRemapMode = VB_REMAP_MODE_NONE;
+         snprintf(stVbConfig.astCommPool[0].acName, MAX_VB_POOL_NAME_LEN, "cv-capture-comm0");
+ 
+@@ -2945,6 +3013,63 @@
+ 
+             b_vb_pool1_created = 1;
+         }
++
++        // create vb pool2 for CHN1: NV21 at HLS resolution (was 640x640 RGB
++        // planar for an unused inference path). NV21 = w*h*3/2.
++        {
++            const char* env_w = getenv("YOLO_HLS_W");
++            const char* env_h = getenv("YOLO_HLS_H");
++            int hls_w = env_w ? atoi(env_w) : 0;
++            int hls_h = env_h ? atoi(env_h) : 0;
++            if (hls_w <= 0) hls_w = cap_width;
++            if (hls_h <= 0) hls_h = cap_height;
++            int hls_buffer_size = ALIGN(hls_w, 64) * ALIGN(hls_h, 64) * 3 / 2;
++
++            VB_POOL_CONFIG_S stVbPoolCfg;
++            stVbPoolCfg.u32BlkSize = hls_buffer_size;
++            // BlkCnt=3: 1 captured + 1 in VENC + 1 free. With 2 we saw
++            // VPSS reuse the slot while VENC was still reading.
++            stVbPoolCfg.u32BlkCnt = 3;
++            stVbPoolCfg.enRemapMode = VB_REMAP_MODE_NONE;
++            snprintf(stVbPoolCfg.acName, MAX_VB_POOL_NAME_LEN, "cv-capture-hls");
++
++            VbPool2 = CVI_VB_CreatePool(&stVbPoolCfg);
++            if (VbPool2 == VB_INVALID_POOLID)
++            {
++                fprintf(stderr, "CVI_VB_CreatePool VbPool2 failed\n");
++                ret_val = -1;
++                goto OUT;
++            }
++
++            b_vb_pool2_created = 1;
++        }
++
++        // create vb pool3 for CHN2: NV21 at Record resolution.
++        {
++            const char* env_w = getenv("YOLO_REC_W");
++            const char* env_h = getenv("YOLO_REC_H");
++            int rec_w = env_w ? atoi(env_w) : 0;
++            int rec_h = env_h ? atoi(env_h) : 0;
++            if (rec_w <= 0) rec_w = cap_width;
++            if (rec_h <= 0) rec_h = cap_height;
++            int rec_buffer_size = ALIGN(rec_w, 64) * ALIGN(rec_h, 64) * 3 / 2;
++
++            VB_POOL_CONFIG_S stVbPoolCfg;
++            stVbPoolCfg.u32BlkSize = rec_buffer_size;
++            stVbPoolCfg.u32BlkCnt = 3;
++            stVbPoolCfg.enRemapMode = VB_REMAP_MODE_NONE;
++            snprintf(stVbPoolCfg.acName, MAX_VB_POOL_NAME_LEN, "cv-capture-rec");
++
++            VbPool3 = CVI_VB_CreatePool(&stVbPoolCfg);
++            if (VbPool3 == VB_INVALID_POOLID)
++            {
++                fprintf(stderr, "CVI_VB_CreatePool VbPool3 failed\n");
++                ret_val = -1;
++                goto OUT;
++            }
++
++            b_vb_pool3_created = 1;
++        }
+     }
+ 
+     // prepare sensor
+@@ -3481,14 +3606,27 @@
+             stGrpAttr.u8VpssDev = 0;
+ 
+             CVI_S32 ret = CVI_VPSS_CreateGrp(VpssGrp, &stGrpAttr);
++            if (ret == (CVI_S32)0xC0068004)
++            {
++                // Group left over from a previous crashed run; reuse it.
++                // Stop and disable all channels so we can reconfigure below.
++                fprintf(stderr, "[capture_cvi] VpssGrp %d exists, reusing\n", (int)VpssGrp);
++                for (int c = 0; c < 4; c++) CVI_VPSS_DisableChn(VpssGrp, c);
++                CVI_VPSS_StopGrp(VpssGrp);
++                // b_vpss_grp_created stays 0 so we don't DestroyGrp in cleanup
++                // (group was not created by us)
++                ret = CVI_SUCCESS;
++            }
++            else if (ret == CVI_SUCCESS)
++            {
++                b_vpss_grp_created = 1;
++            }
+             if (ret != CVI_SUCCESS)
+             {
+                 fprintf(stderr, "CVI_VPSS_CreateGrp failed %x\n", ret);
+                 ret_val = -1;
+                 goto OUT;
+             }
+-
+-            b_vpss_grp_created = 1;
+         }
+ 
+         if (crop_width != cap_width || crop_height != cap_height)
+@@ -3511,14 +3649,23 @@
+         }
+ 
+         // vpss set chn attr
+-        {
++        // CHN0 (BGR display). Rotation NOT applied here - cv181x VPSS NV12
++        // chns reject bMirror+bFlip with VPSS_ILLEGAL_PARAM, so we cannot
++        // mix VPSS-rotated CHN0 with non-rotated CHN1/CHN2. Instead we
++        // flip the sensor itself (GC4653 reg 0x0101 = 0x03) so that all
++        // downstream chns see correctly-oriented data without any chn-
++        // specific rotation.
++        {
++            const char* env_yolo_fps = getenv("YOLO_YOLO_FPS");
++            int yolo_dst_fps = env_yolo_fps ? atoi(env_yolo_fps) : -1;
++            if (yolo_dst_fps == 0) yolo_dst_fps = -1;
+             VPSS_CHN_ATTR_S stChnAttr;
+             stChnAttr.u32Width = output_width;
+             stChnAttr.u32Height = output_height;
+             stChnAttr.enVideoFormat = VIDEO_FORMAT_LINEAR;
+             stChnAttr.enPixelFormat = PIXEL_FORMAT_BGR_888;
+             stChnAttr.stFrameRate.s32SrcFrameRate = -1;
+-            stChnAttr.stFrameRate.s32DstFrameRate = -1;
++            stChnAttr.stFrameRate.s32DstFrameRate = yolo_dst_fps;
+             stChnAttr.bMirror = CVI_FALSE;
+             stChnAttr.bFlip = CVI_FALSE;
+             stChnAttr.u32Depth = 1;
+@@ -3572,6 +3719,176 @@
+ 
+             b_vpss_vbpool_attached = 1;
+         }
++
++        // vpss chn1: NV21 at YOLO_HLS_W x YOLO_HLS_H for HLS encoder.
++        // Rotated to match CHN0 / sensor orientation when YOLO_ROTATE=1.
++        // DstFrameRate driven by YOLO_HLS_FPS so HLS can run slower than
++        // capture rate to save bandwidth without throttling YOLO/record.
++        // Default dims fall back to CHN0 output_width/height if env not set.
++        {
++            const char* env_rot = getenv("YOLO_ROTATE");
++            bool rot180 = !env_rot || env_rot[0] != '0';
++            const char* env_w = getenv("YOLO_HLS_W");
++            const char* env_h = getenv("YOLO_HLS_H");
++            const char* env_fps = getenv("YOLO_HLS_FPS");
++            int hls_w = env_w ? atoi(env_w) : 0;
++            int hls_h = env_h ? atoi(env_h) : 0;
++            if (hls_w <= 0) hls_w = output_width;
++            if (hls_h <= 0) hls_h = output_height;
++            int hls_dst_fps = env_fps ? atoi(env_fps) : -1;
++            if (hls_dst_fps == 0) hls_dst_fps = -1;
++            // cv181x VPSS rejects PIXEL_FORMAT_NV21 with VPSS_ILLEGAL_PARAM
++            // on chn output (CVI_VPSS_SetChnAttr returns 0xc0068003);
++            // PIXEL_FORMAT_NV12 is accepted and VENC consumes it without
++            // any swizzle. Same H264 quality.
++            VPSS_CHN_ATTR_S stChnAttr;
++            memset(&stChnAttr, 0, sizeof(stChnAttr));
++            stChnAttr.u32Width = hls_w;
++            stChnAttr.u32Height = hls_h;
++            stChnAttr.enVideoFormat = VIDEO_FORMAT_LINEAR;
++            stChnAttr.enPixelFormat = PIXEL_FORMAT_NV12;
++            // cv181x VPSS NV12 chn rejects an explicit DstFrameRate (only
++            // -1 is accepted); leave at sensor rate and rate-limit per chn
++            // in main.cpp instead.
++            stChnAttr.stFrameRate.s32SrcFrameRate = -1;
++            stChnAttr.stFrameRate.s32DstFrameRate = -1;
++            (void)hls_dst_fps;
++            stChnAttr.bMirror = CVI_FALSE;
++            stChnAttr.bFlip = CVI_FALSE;
++            stChnAttr.u32Depth = 1;
++            stChnAttr.stAspectRatio.enMode = ASPECT_RATIO_NONE;
++            stChnAttr.stAspectRatio.bEnableBgColor = CVI_FALSE;
++            stChnAttr.stAspectRatio.u32BgColor = 0;
++            stChnAttr.stAspectRatio.stVideoRect.s32X = 0;
++            stChnAttr.stAspectRatio.stVideoRect.s32Y = 0;
++            stChnAttr.stAspectRatio.stVideoRect.u32Width = stChnAttr.u32Width;
++            stChnAttr.stAspectRatio.stVideoRect.u32Height = stChnAttr.u32Height;
++            stChnAttr.stNormalize.bEnable = CVI_FALSE;
++            stChnAttr.stNormalize.factor[0] = 0.f;
++            stChnAttr.stNormalize.factor[1] = 0.f;
++            stChnAttr.stNormalize.factor[2] = 0.f;
++            stChnAttr.stNormalize.mean[0] = 0.f;
++            stChnAttr.stNormalize.mean[1] = 0.f;
++            stChnAttr.stNormalize.mean[2] = 0.f;
++            stChnAttr.stNormalize.rounding = VPSS_ROUNDING_TO_EVEN;
++
++            CVI_S32 ret = CVI_VPSS_SetChnAttr(VpssGrp, VPSS_CHN1, &stChnAttr);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VPSS_SetChnAttr CHN1 failed %x\n", ret);
++                ret_val = -1;
++                goto OUT;
++            }
++            fprintf(stderr, "[capture_cvi] CHN1 NV12 %dx%d dst_fps=%d rot=%d\n",
++                    hls_w, hls_h, hls_dst_fps, (int)rot180);
++        }
++
++        {
++            CVI_S32 ret = CVI_VPSS_EnableChn(VpssGrp, VPSS_CHN1);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VPSS_EnableChn CHN1 failed %x\n", ret);
++                ret_val = -1;
++                goto OUT;
++            }
++
++            b_vpss_chn1_enabled = 1;
++        }
++
++        {
++            CVI_S32 ret = CVI_VPSS_AttachVbPool(VpssGrp, VPSS_CHN1, VbPool2);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VPSS_AttachVbPool CHN1 failed %x\n", ret);
++                ret_val = -1;
++                goto OUT;
++            }
++
++            b_vpss_chn1_vbpool_attached = 1;
++        }
++
++        // vpss chn2: NV21 at YOLO_REC_W x YOLO_REC_H for record encoder.
++        // Same rotation as CHN0/CHN1. DstFrameRate from YOLO_REC_FPS so
++        // record can run at full capture rate while HLS stays slow.
++        {
++            const char* env_rot = getenv("YOLO_ROTATE");
++            bool rot180 = !env_rot || env_rot[0] != '0';
++            const char* env_w = getenv("YOLO_REC_W");
++            const char* env_h = getenv("YOLO_REC_H");
++            const char* env_fps = getenv("YOLO_REC_FPS");
++            int rec_w = env_w ? atoi(env_w) : 0;
++            int rec_h = env_h ? atoi(env_h) : 0;
++            if (rec_w <= 0) rec_w = output_width;
++            if (rec_h <= 0) rec_h = output_height;
++            int rec_dst_fps = env_fps ? atoi(env_fps) : -1;
++            if (rec_dst_fps == 0) rec_dst_fps = -1;
++            // NV12, not NV21 (see CHN1 comment). Rotation applied via
++            // VPSS HW mirror+flip; rotation+NV12 path was verified on
++            // 1.121 at 1920x1080.
++            VPSS_CHN_ATTR_S stChnAttr;
++            memset(&stChnAttr, 0, sizeof(stChnAttr));
++            stChnAttr.u32Width = rec_w;
++            stChnAttr.u32Height = rec_h;
++            stChnAttr.enVideoFormat = VIDEO_FORMAT_LINEAR;
++            stChnAttr.enPixelFormat = PIXEL_FORMAT_NV12;
++            // See CHN1 - NV12 chn rejects explicit DstFrameRate.
++            stChnAttr.stFrameRate.s32SrcFrameRate = -1;
++            stChnAttr.stFrameRate.s32DstFrameRate = -1;
++            (void)rec_dst_fps;
++            stChnAttr.bMirror = CVI_FALSE;
++            stChnAttr.bFlip = CVI_FALSE;
++            stChnAttr.u32Depth = 1;
++            stChnAttr.stAspectRatio.enMode = ASPECT_RATIO_NONE;
++            stChnAttr.stAspectRatio.bEnableBgColor = CVI_FALSE;
++            stChnAttr.stAspectRatio.u32BgColor = 0;
++            stChnAttr.stAspectRatio.stVideoRect.s32X = 0;
++            stChnAttr.stAspectRatio.stVideoRect.s32Y = 0;
++            stChnAttr.stAspectRatio.stVideoRect.u32Width = stChnAttr.u32Width;
++            stChnAttr.stAspectRatio.stVideoRect.u32Height = stChnAttr.u32Height;
++            stChnAttr.stNormalize.bEnable = CVI_FALSE;
++            stChnAttr.stNormalize.factor[0] = 0.f;
++            stChnAttr.stNormalize.factor[1] = 0.f;
++            stChnAttr.stNormalize.factor[2] = 0.f;
++            stChnAttr.stNormalize.mean[0] = 0.f;
++            stChnAttr.stNormalize.mean[1] = 0.f;
++            stChnAttr.stNormalize.mean[2] = 0.f;
++            stChnAttr.stNormalize.rounding = VPSS_ROUNDING_TO_EVEN;
++
++            CVI_S32 ret = CVI_VPSS_SetChnAttr(VpssGrp, VPSS_CHN2, &stChnAttr);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VPSS_SetChnAttr CHN2 failed %x\n", ret);
++                ret_val = -1;
++                goto OUT;
++            }
++            fprintf(stderr, "[capture_cvi] CHN2 NV12 %dx%d dst_fps=%d rot=%d\n",
++                    rec_w, rec_h, rec_dst_fps, (int)rot180);
++        }
++
++        {
++            CVI_S32 ret = CVI_VPSS_EnableChn(VpssGrp, VPSS_CHN2);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VPSS_EnableChn CHN2 failed %x\n", ret);
++                ret_val = -1;
++                goto OUT;
++            }
++
++            b_vpss_chn2_enabled = 1;
++        }
++
++        {
++            CVI_S32 ret = CVI_VPSS_AttachVbPool(VpssGrp, VPSS_CHN2, VbPool3);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VPSS_AttachVbPool CHN2 failed %x\n", ret);
++                ret_val = -1;
++                goto OUT;
++            }
++
++            b_vpss_chn2_vbpool_attached = 1;
++        }
++
+     }
+ 
+     return 0;
+@@ -3636,6 +3953,71 @@
+         b_vpss_grp_started = 1;
+     }
+ 
++    // Runtime sensor fps override via direct cmos_fps_set callback.
++    // CVI_ISP_SetPubAttr(f32FrameRate) only updates ISP-level metadata; it
++    // does NOT trigger the sensor's pfn_cmos_fps_set, so the sensor keeps
++    // outputting at the mode's hardcoded 30fps. Here we fetch the AE func
++    // table directly from pstSnsObj and invoke cmos_fps_set ourselves,
++    // which writes the VTS register (0x0340/0x0341) via the I2C cache.
++    // cmos_fps_set only READS from sensor internal singletons (pstSnsState,
++    // pstSnsRegsInfo) and WRITES to our passed struct, so a zeroed
++    // AE_SENSOR_DEFAULT_S is safe input.
++    {
++        const char* fps_env = getenv("YOLO_CAP_FPS");
++        if (fps_env && pstSnsObj && pstSnsObj->pfnWriteReg)
++        {
++            float v = (float)atof(fps_env);
++            if (v >= 2.75f && v <= 30.0f)
++            {
++                struct FpsThArg { float fps; VI_PIPE pipe; };
++                FpsThArg* a = (FpsThArg*)malloc(sizeof(FpsThArg));
++                a->fps = v; a->pipe = ViPipe;
++                pthread_t tid;
++                auto th = +[](void* p) -> void* {
++                    FpsThArg* a = (FpsThArg*)p;
++                    sleep(3);
++                    // GC4653 1440P30 default VTS = 1500 (HTS = 1600).
++                    // Scale: new_VTS = 1500 * 30 / target_fps.
++                    // VTS reg: 0x0340 (high, bit[13:8]) / 0x0341 (low).
++                    CVI_U32 vmax = (CVI_U32)(1500.0f * 30.0f / a->fps);
++                    if (vmax > 16383) vmax = 16383;
++                    CVI_U8 vts_h = (vmax >> 8) & 0xFF;
++                    CVI_U8 vts_l = vmax & 0xFF;
++                    if (pstSnsObj && pstSnsObj->pfnWriteReg)
++                    {
++                        // GC4653 only: write VTS register (0x0340/0x0341). No
++                        // chip-id probe — pfnReadReg on .195 disturbs the sensor
++                        // I2C bus enough that CVI_VI_GetChnFrame later fails
++                        // with c00e8040 (Operation not permitted).
++                        CVI_S32 r1 = pstSnsObj->pfnWriteReg(a->pipe, 0x0340, vts_h);
++                        CVI_S32 r2 = pstSnsObj->pfnWriteReg(a->pipe, 0x0341, vts_l);
++                        fprintf(stderr, "[cvi] sensor VTS write fps=%.2f vmax=%u (0x%02x%02x) ret=%d/%d\n",
++                                a->fps, vmax, vts_h, vts_l, r1, r2);
++                        // GC4653 mirror+flip register 0x0101:
++                        //   bit[0] = mirror (horizontal flip)
++                        //   bit[1] = flip (vertical flip)
++                        // Writing 0x03 rotates sensor output 180 degrees so
++                        // every downstream chn (CHN0 BGR for YOLO, CHN1/2
++                        // NV12 for HLS/record) sees correctly-oriented data.
++                        const char* rot_env = getenv("YOLO_ROTATE");
++                        bool rot180 = !rot_env || rot_env[0] != '0';
++                        if (rot180) {
++                            CVI_S32 r3 = pstSnsObj->pfnWriteReg(a->pipe, 0x0101, 0x03);
++                            fprintf(stderr, "[cvi] sensor mirror+flip write 0x0101=0x03 ret=%d\n", r3);
++                        }
++                        fflush(stderr);
++                    }
++                    free(a);
++                    return NULL;
++                };
++                pthread_create(&tid, NULL, th, a);
++                pthread_detach(tid);
++                fprintf(stderr, "[cvi] fps override thread spawned for %.2f fps\n", v);
++                fflush(stderr);
++            }
++        }
++    }
++
+     return 0;
+ 
+ OUT:
+@@ -3643,7 +4025,8 @@
+     return ret_val;
+ }
+ 
+-int capture_cvi_impl::read_frame(unsigned char* bgrdata)
++//modified by jj
++int capture_cvi_impl::read_frame(unsigned char* bgrdata, bool retain_image_ptr)
+ {
+     int ret_val = 0;
+ 
+@@ -3656,8 +4039,12 @@
+             ret_val = -1;
+             goto OUT;
+         }
+-
+         b_vi_frame_got = 1;
++        if (retain_image_ptr)
++        {
++            original_image_ptr = new VIDEO_FRAME_INFO_S;
++            memcpy(original_image_ptr, &stFrameInfo, sizeof(VIDEO_FRAME_INFO_S));
++        } 
+     }
+ 
+     if (0)
+@@ -3686,7 +4073,7 @@
+ 
+     // vpss send frame
+     {
+-        CVI_S32 ret = CVI_VPSS_SendFrame(VpssGrp, &stFrameInfo, -1);
++        CVI_S32 ret = CVI_VPSS_SendFrame(VpssGrp, &stFrameInfo, 2000);
+         if (ret != CVI_SUCCESS)
+         {
+             fprintf(stderr, "CVI_VPSS_SendFrame failed %x\n", ret);
+@@ -3708,6 +4095,28 @@
+         b_vpss_frame_got = 1;
+     }
+ 
++    // CHN1 (HLS NV21) and CHN2 (Record NV21). Frames are exposed via
++    // getImagePtr()/getImagePtr2() for stream_yolo to feed VENC chn0/chn1
++    // without any software conversion. GetChnFrame respects each chn's
++    // configured DstFrameRate, so HLS / Record can be slower than capture.
++    {
++        CVI_S32 ret = CVI_VPSS_GetChnFrame(VpssGrp, VPSS_CHN1, &stFrameInfo_infer, 200);
++        if (ret == CVI_SUCCESS)
++        {
++            b_vpss_infer_frame_got = 1;
++        }
++        // No log on miss - normal when CHN1 fps < capture fps.
++    }
++
++    {
++        CVI_S32 ret = CVI_VPSS_GetChnFrame(VpssGrp, VPSS_CHN2, &stFrameInfo_infer2, 200);
++        if (ret == CVI_SUCCESS)
++        {
++            b_vpss_infer2_frame_got = 1;
++        }
++        // No log on miss - normal when CHN2 fps < capture fps.
++    }
++
+     if (0)
+     {
+         // dump
+@@ -3789,19 +4198,51 @@
+ 
+ OUT:
+ 
+-    if (b_vpss_frame_got)
++    if (b_vpss_infer_frame_got)
+     {
+-        CVI_S32 ret = CVI_VPSS_ReleaseChnFrame(VpssGrp, VpssChn, &stFrameInfo_bgr);
+-        if (ret != CVI_SUCCESS)
++        if (retain_image_ptr)
+         {
+-            fprintf(stderr, "CVI_VPSS_ReleaseChnFrame failed %x\n", ret);
+-            ret_val = -1;
++            image_ptr = new VIDEO_FRAME_INFO_S;
++            memcpy(image_ptr, &stFrameInfo_infer, sizeof(VIDEO_FRAME_INFO_S));
++        }
++        else
++        {
++            CVI_VPSS_ReleaseChnFrame(VpssGrp, VPSS_CHN1, &stFrameInfo_infer);
+         }
++        b_vpss_infer_frame_got = 0;
++    }
+ 
+-        b_vpss_frame_got = 0;
++    if (b_vpss_infer2_frame_got)
++    {
++        if (retain_image_ptr)
++        {
++            image_ptr2 = new VIDEO_FRAME_INFO_S;
++            memcpy(image_ptr2, &stFrameInfo_infer2, sizeof(VIDEO_FRAME_INFO_S));
++        }
++        else
++        {
++            CVI_VPSS_ReleaseChnFrame(VpssGrp, VPSS_CHN2, &stFrameInfo_infer2);
++        }
++        b_vpss_infer2_frame_got = 0;
+     }
+ 
+-    if (b_vi_frame_got)
++    if (b_vpss_frame_got)
++    {
++        if (!retain_image_ptr)
++        {
++            CVI_S32 ret = CVI_VPSS_ReleaseChnFrame(VpssGrp, VpssChn, &stFrameInfo_bgr);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VPSS_ReleaseChnFrame failed %x\n", ret);
++                ret_val = -1;
++            }
++            b_vpss_frame_got = 0;
++        }
++        // else: retain_image_ptr=true -> keep stFrameInfo_bgr alive for getVpssFramePtr();
++        // caller must trigger release via releaseImagePtr().
++    }
++
++    if (b_vi_frame_got && !retain_image_ptr)
+     {
+         CVI_S32 ret = CVI_VI_ReleaseChnFrame(ViPipe, ViChn, &stFrameInfo);
+         if (ret != CVI_SUCCESS)
+@@ -3812,10 +4253,66 @@
+ 
+         b_vi_frame_got = 0;
+     }
+-
++    else if (b_vi_frame_got && retain_image_ptr)
++    {
++        b_vi_frame_got = 0;
++    }
+     return ret_val;
+ }
+ 
++void* capture_cvi_impl::read_frame_raw()
++{
++    releaseImagePtr();
++    CVI_S32 ret = CVI_VI_GetChnFrame(ViPipe, ViChn, &stFrameInfo, 2000);
++    if (ret != CVI_SUCCESS)
++    {
++        fprintf(stderr, "CVI_VI_GetChnFrame raw failed %x\n", ret);
++        return nullptr;
++    }
++    original_image_ptr = new VIDEO_FRAME_INFO_S;
++    memcpy(original_image_ptr, &stFrameInfo, sizeof(VIDEO_FRAME_INFO_S));
++    return original_image_ptr;
++}
++
++//added by jj
++void* capture_cvi_impl::getImagePtr() {
++    return image_ptr;
++}
++
++void* capture_cvi_impl::getImagePtr2() {
++    return image_ptr2;
++}
++
++void* capture_cvi_impl::getOriginalImagePtr() {
++    return original_image_ptr;
++}
++
++void* capture_cvi_impl::getVpssFramePtr() {
++    return b_vpss_frame_got ? &stFrameInfo_bgr : nullptr;
++}
++
++void capture_cvi_impl::releaseImagePtr() {
++    if(b_vpss_frame_got) {
++        CVI_VPSS_ReleaseChnFrame(VpssGrp, VpssChn, &stFrameInfo_bgr);
++        b_vpss_frame_got = 0;
++    }
++    if(image_ptr) {
++        CVI_VPSS_ReleaseChnFrame(VpssGrp, VPSS_CHN1, (VIDEO_FRAME_INFO_S *)image_ptr);
++        delete (VIDEO_FRAME_INFO_S *)image_ptr;
++        image_ptr = nullptr;
++    }
++    if(image_ptr2) {
++        CVI_VPSS_ReleaseChnFrame(VpssGrp, VPSS_CHN2, (VIDEO_FRAME_INFO_S *)image_ptr2);
++        delete (VIDEO_FRAME_INFO_S *)image_ptr2;
++        image_ptr2 = nullptr;
++    }
++    if(original_image_ptr) {
++        CVI_VI_ReleaseChnFrame(ViPipe, ViChn, (VIDEO_FRAME_INFO_S *)original_image_ptr);
++        delete (VIDEO_FRAME_INFO_S *)original_image_ptr;
++        original_image_ptr = nullptr;
++    }
++}
++
+ int capture_cvi_impl::stop_streaming()
+ {
+     int ret_val = 0;
+@@ -3889,6 +4386,12 @@
+ 
+     ret_val = stop_streaming();
+ 
++    if (b_vpss_infer_frame_got)
++    {
++        CVI_VPSS_ReleaseChnFrame(VpssGrp, VPSS_CHN1, &stFrameInfo_infer);
++        b_vpss_infer_frame_got = 0;
++    }
++
+     if (b_vpss_frame_got)
+     {
+         CVI_S32 ret = CVI_VPSS_ReleaseChnFrame(VpssGrp, VpssChn, &stFrameInfo_bgr);
+@@ -3915,6 +4418,30 @@
+ 
+     // vpss exit
+     {
++        if (b_vpss_chn2_vbpool_attached)
++        {
++            CVI_VPSS_DetachVbPool(VpssGrp, VPSS_CHN2);
++            b_vpss_chn2_vbpool_attached = 0;
++        }
++
++        if (b_vpss_chn2_enabled)
++        {
++            CVI_VPSS_DisableChn(VpssGrp, VPSS_CHN2);
++            b_vpss_chn2_enabled = 0;
++        }
++
++        if (b_vpss_chn1_vbpool_attached)
++        {
++            CVI_VPSS_DetachVbPool(VpssGrp, VPSS_CHN1);
++            b_vpss_chn1_vbpool_attached = 0;
++        }
++
++        if (b_vpss_chn1_enabled)
++        {
++            CVI_VPSS_DisableChn(VpssGrp, VPSS_CHN1);
++            b_vpss_chn1_enabled = 0;
++        }
++
+         if (b_vpss_vbpool_attached)
+         {
+             CVI_S32 ret = CVI_VPSS_DetachVbPool(VpssGrp, VpssChn);
+@@ -4086,6 +4613,30 @@
+ 
+             b_vb_pool1_created = 0;
+         }
++
++        if (b_vb_pool2_created)
++        {
++            CVI_S32 ret = CVI_VB_DestroyPool(VbPool2);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VB_DestroyPool failed %x\n", ret);
++                ret_val = -1;
++            }
++
++            b_vb_pool2_created = 0;
++        }
++
++        if (b_vb_pool3_created)
++        {
++            CVI_S32 ret = CVI_VB_DestroyPool(VbPool3);
++            if (ret != CVI_SUCCESS)
++            {
++                fprintf(stderr, "CVI_VB_DestroyPool VbPool3 failed %x\n", ret);
++                ret_val = -1;
++            }
++
++            b_vb_pool3_created = 0;
++        }
+     }
+ 
+     if (b_sys_vi_opened)
+@@ -4168,13 +4719,14 @@
+     b_vpss_grp_started = 0;
+     b_vpss_frame_got = 0;
+ 
+-    VpssGrp = 0;
++    VpssGrp = 2;
+     // VpssGrp = CVI_VPSS_GetAvailableGrp();
+     VpssChn = VPSS_CHN0;
+ 
+     return ret_val;
+ }
+ 
++//interfaces
+ bool capture_cvi::supported()
+ {
+     if (!sys.ready)
+@@ -4235,9 +4787,33 @@
+     return d->start_streaming();
+ }
+ 
+-int capture_cvi::read_frame(unsigned char* bgrdata)
+-{
+-    return d->read_frame(bgrdata);
++//added by jj
++int capture_cvi::read_frame(unsigned char* bgrdata, bool retain_image_ptr) {
++    return d->read_frame(bgrdata, retain_image_ptr);
++}
++
++void* capture_cvi::read_frame_raw() {
++    return d->read_frame_raw();
++}
++
++void* capture_cvi::getImagePtr() {
++    return d->getImagePtr();
++}
++
++void* capture_cvi::getImagePtr2() {
++    return d->getImagePtr2();
++}
++
++void* capture_cvi::getOriginalImagePtr() {
++    return d->getOriginalImagePtr();
++}
++
++void* capture_cvi::getVpssFramePtr() {
++    return d->getVpssFramePtr();
++}
++
++void capture_cvi::releaseImagePtr() {
++    d->releaseImagePtr();
+ }
+ 
+ int capture_cvi::stop_streaming()
+@@ -4250,4 +4826,4 @@
+     return d->close();
+ }
+ 
+-} // namespace cv
++} 

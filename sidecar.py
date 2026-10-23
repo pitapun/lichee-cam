@@ -11,7 +11,7 @@ NintiDetect sidecar
 import json, os, shutil, subprocess, threading, time, socket, sys, io, collections, select
 import hashlib, base64
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from queue import Queue, Empty
 import http.client
 
@@ -27,10 +27,42 @@ MJPEG_PORT  = 7777
 EVENT_DIR   = os.environ.get('NINTI_EVENT_DIR', '/root/ninti_events')
 EVENT_FILE  = os.path.join(EVENT_DIR, 'events.jsonl')
 EVENT_VIDEO_FPS = 25.0
-EVENT_STORAGE_MAX_USED_PCT = 80.0
-EVENT_STORAGE_TARGET_USED_PCT = 75.0
+# Emergency valve only.  Once the clip recorder shares the card, "80% of the
+# filesystem" stops being a sensible trigger for deleting events — the two
+# would take turns refilling each other's space.  Each side now has its own
+# byte budget (events_max_gb / clips_max_gb) and these percentages exist just
+# to stop a runaway.  CLIP_MIN_FREE_BYTES is deliberately larger than the free
+# space these imply, so clips always yield before events do.
+EVENT_STORAGE_MAX_USED_PCT = 95.0
+EVENT_STORAGE_TARGET_USED_PCT = 92.0
 EVENT_STORAGE_CHECK_SEC = 300
+# Hard byte cap for the events dir, on top of the percentage watermark above.
+# The percentage alone cannot share a card with the clip recorder: it only
+# trips at 80% of the whole filesystem, so events and clips would each grow
+# into the other's space and thrash.  Two explicit budgets do not.
+EVENT_DEFAULT_MAX_GB = 6.0
 HD_RECORD_CONTROL_FILE = '/tmp/ninti_hd_record_dir'
+# Every log this thing writes lives in /tmp, which is tmpfs, so a reboot
+# destroys the evidence for why it rebooted.  This one file is on the SD card.
+REBOOT_LOG = '/root/ninti_reboot.log'
+REBOOT_LOG_KEEP_LINES = 400
+
+# ---- Continuous ("dash cam") clip recorder ----
+# Tees the CHN0 live H264 that _live_ws_reader_loop already pulls out of
+# /tmp/hls_feed.h264 into rolling segment files.  There is no second encode:
+# the bytes are already in hand, so the added cost is one write() per FIFO
+# chunk plus one `-c copy` remux per finished segment.
+CLIP_DIR = os.environ.get('NINTI_CLIP_DIR', '/root/ninti_clips')
+CLIP_DEFAULT_SECS = 600
+CLIP_DEFAULT_MAX_GB = 20.0
+CLIP_MIN_SECS = 30
+CLIP_MIN_FREE_BYTES = 2560 * 1024 * 1024  # clips yield here, above the events valve
+CLIP_WRITE_BUFFER = 256 * 1024            # few large SD writes instead of many 8 KB ones
+CLIP_INDEX_NAME = 'clips.jsonl'           # real duration per clip, for the timeline
+CLIP_MARKS_TAIL_BYTES = 512 * 1024        # only the tail of events.jsonl feeds the timeline
+EXPORT_MAX_SECS = 3600                    # one hour; the device copies about 10x realtime
+EXPORT_MIN_SECS = 2
+_export_lock = threading.Lock()           # one export at a time — it competes with the recorder for the card
 
 DEFAULT_CONFIG = {
     'mode': 'ninti',
@@ -63,6 +95,10 @@ DEFAULT_CONFIG = {
     'record_width':  1920,
     'record_height': 1080,
     'record_fps': 10,
+    'clips_enabled': True,
+    'clips_secs': CLIP_DEFAULT_SECS,
+    'clips_max_gb': CLIP_DEFAULT_MAX_GB,
+    'events_max_gb': EVENT_DEFAULT_MAX_GB,
     # Sensor capture rate cap (target_fps). Per-chn fps is clamped to this.
     'target_fps': 10,
     # GC4653 is physically mounted upside-down; rotate 180 in VPSS HW.
@@ -368,8 +404,32 @@ def public_cfg():
 
 # ---- Minimal MQTT publisher (MQTT 3.1.1, QoS 0, stdlib only) ----
 mqtt_lock = threading.Lock()
-mqtt_state = {'last_error': '', 'last_pub': 0, 'discovery_sent': False}
+mqtt_state = {'last_error': '', 'last_pub': 0, 'discovery_sent': False,
+              'connected': False, 'connects': 0, 'since': 0}
 _mqtt_last_status = 0
+
+# One connection, held open.  The old code opened a TCP connection, sent
+# CONNECT, published and closed it again for every message — with the status
+# loop publishing every 5s that was a permanent connect/disconnect storm in
+# the broker's log, and an unclean close each time (no DISCONNECT packet).
+MQTT_KEEPALIVE = 60          # advertised to the broker
+# Ping on a fixed cadence, NOT "once the link has been idle" — the status loop
+# publishes every 5s, so an idle-based trigger never fires, no PINGRESP ever
+# comes back, and a liveness check that waits for inbound bytes then declares a
+# perfectly healthy connection dead. That cost one false reconnect every 150s.
+MQTT_PING_INTERVAL = 30.0    # half the advertised keepalive
+MQTT_PING_TIMEOUT = 15.0     # no PINGRESP within this -> the link really is gone
+MQTT_RETRY_MIN = 2.0
+MQTT_RETRY_MAX = 60.0
+
+_mqtt_sock = None
+_mqtt_key = None             # (host, port, user, pass) the live socket belongs to
+_mqtt_last_tx = 0.0
+_mqtt_last_rx = 0.0
+_mqtt_retry_at = 0.0
+_mqtt_retry_delay = MQTT_RETRY_MIN
+_mqtt_ping_at = 0.0          # when the outstanding PINGREQ went out, 0 = none
+_mqtt_ping_next = 0.0        # when the next PINGREQ is due
 
 def _mqtt_enabled_cfg():
     with config_lock:
@@ -399,18 +459,31 @@ def _mqtt_str(s):
     b = str(s).encode('utf-8')
     return len(b).to_bytes(2, 'big') + b
 
-def _mqtt_connect_packet(client_id, username, password):
-    flags = 0x02
+def _mqtt_connect_packet(client_id, username, password, will=None,
+                         keepalive=MQTT_KEEPALIVE):
+    """CONNECT, optionally with a retained Last Will.
+
+    Payload order is fixed by the spec: ClientId, WillTopic, WillMessage,
+    UserName, Password.
+    """
+    flags = 0x02                                  # clean session
     payload = _mqtt_str(client_id)
+    if will:
+        flags |= 0x04 | 0x20                      # will flag + will retain, QoS 0
+        payload += _mqtt_str(will[0]) + _mqtt_str(will[1])
     if username:
         flags |= 0x80
         payload += _mqtt_str(username)
     if password:
         flags |= 0x40
         payload += _mqtt_str(password)
-    vh = _mqtt_str('MQTT') + bytes([4, flags]) + (30).to_bytes(2, 'big')
+    vh = _mqtt_str('MQTT') + bytes([4, flags]) + int(keepalive).to_bytes(2, 'big')
     body = vh + payload
     return bytes([0x10]) + _mqtt_rl(len(body)) + body
+
+
+MQTT_DISCONNECT = b'\xe0\x00'
+MQTT_PINGREQ = b'\xc0\x00'
 
 def _mqtt_publish_packet(topic, payload, retain=False):
     if isinstance(payload, dict):
@@ -418,35 +491,184 @@ def _mqtt_publish_packet(topic, payload, retain=False):
     body = _mqtt_str(topic) + str(payload).encode('utf-8')
     return bytes([0x31 if retain else 0x30]) + _mqtt_rl(len(body)) + body
 
+def _mqtt_client_id():
+    return 'nintidetect-' + socket.gethostname()
+
+
+def _mqtt_close_locked(why=''):
+    """Drop the connection, politely if the socket still works. Hold mqtt_lock."""
+    global _mqtt_sock, _mqtt_key
+    s, _mqtt_sock, _mqtt_key = _mqtt_sock, None, None
+    mqtt_state['connected'] = False
+    if s is None:
+        return
+    try:
+        s.settimeout(1)
+        s.sendall(MQTT_DISCONNECT)     # a clean close, so the broker log stays quiet
+    except Exception:
+        pass
+    try:
+        s.close()
+    except Exception:
+        pass
+    if why:
+        print(f'[mqtt] disconnected: {why}', flush=True)
+
+
+def _mqtt_connect_locked(mc):
+    """Open the single connection. None while backing off. Hold mqtt_lock."""
+    global _mqtt_sock, _mqtt_key, _mqtt_last_tx, _mqtt_last_rx
+    global _mqtt_retry_at, _mqtt_retry_delay, _mqtt_ping_at, _mqtt_ping_next
+    now = time.time()
+    if now < _mqtt_retry_at:
+        return None
+    try:
+        s = socket.create_connection((mc['host'], mc['port']), timeout=5)
+        s.settimeout(5)
+        cid = _mqtt_client_id()
+        # Last Will: without one the retained availability stays 'online' for
+        # ever after the camera dies, because nothing is left to publish otherwise.
+        s.sendall(_mqtt_connect_packet(cid, mc['username'], mc['password'],
+                                       will=(f"{mc['base']}/availability", 'offline')))
+        resp = s.recv(4)
+        if len(resp) < 4 or resp[0] != 0x20 or resp[3] != 0:
+            raise RuntimeError(f'connect refused {resp!r}')
+        _mqtt_sock = s
+        _mqtt_key = (mc['host'], mc['port'], mc['username'], mc['password'])
+        _mqtt_last_tx = _mqtt_last_rx = now
+        _mqtt_ping_at = 0.0
+        _mqtt_ping_next = now + MQTT_PING_INTERVAL
+        _mqtt_retry_delay = MQTT_RETRY_MIN
+        mqtt_state['connected'] = True
+        mqtt_state['connects'] = mqtt_state.get('connects', 0) + 1
+        mqtt_state['since'] = now
+        mqtt_state['last_error'] = ''
+        # The will may have flipped the retained availability to 'offline', and
+        # this is a clean session, so republish the retained discovery set.
+        mqtt_state['discovery_sent'] = False
+        print(f'[mqtt] connected {mc["host"]}:{mc["port"]} as {cid} '
+              f'(#{mqtt_state["connects"]})', flush=True)
+        return s
+    except Exception as e:
+        mqtt_state['last_error'] = str(e)
+        mqtt_state['connected'] = False
+        _mqtt_retry_at = now + _mqtt_retry_delay
+        print(f'[mqtt] connect failed ({e}); retry in {_mqtt_retry_delay:.0f}s', flush=True)
+        _mqtt_retry_delay = min(MQTT_RETRY_MAX, _mqtt_retry_delay * 2)
+        return None
+
+
+def _mqtt_drain_locked():
+    """Consume PINGRESP etc. and refresh the liveness clock. Hold mqtt_lock."""
+    global _mqtt_last_rx
+    s = _mqtt_sock
+    if s is None:
+        return
+    try:
+        s.settimeout(0)
+        while True:
+            chunk = s.recv(256)
+            if not chunk:
+                raise ConnectionResetError('broker closed the connection')
+            _mqtt_last_rx = time.time()
+    except (BlockingIOError, InterruptedError, TimeoutError):
+        pass
+    except Exception as e:
+        _mqtt_close_locked(str(e))
+    finally:
+        if _mqtt_sock is not None:
+            try:
+                _mqtt_sock.settimeout(5)
+            except Exception:
+                pass
+
+
 def _mqtt_publish_many(messages):
+    global _mqtt_last_tx, _mqtt_retry_at
     mc = _mqtt_enabled_cfg()
     if not mc['enabled'] or not mc['host']:
+        with mqtt_lock:
+            if _mqtt_sock is not None:
+                _mqtt_close_locked('mqtt disabled')
         return False
+    blob = b''.join(_mqtt_publish_packet(t, p, r) for t, p, r in messages)
+    if not blob:
+        return True
+    key = (mc['host'], mc['port'], mc['username'], mc['password'])
     with mqtt_lock:
-        try:
-            s = socket.create_connection((mc['host'], mc['port']), timeout=3)
+        if _mqtt_sock is not None and _mqtt_key != key:
+            _mqtt_close_locked('broker settings changed')
+        # A write into a socket the broker has already closed still succeeds —
+        # TCP just buffers it and the RST arrives later — so the message would
+        # be lost silently. Reading first turns that FIN into a reconnect.
+        if _mqtt_sock is not None:
+            _mqtt_drain_locked()
+        for attempt in (1, 2):
+            s = _mqtt_sock or _mqtt_connect_locked(mc)
+            if s is None:
+                return False
             try:
-                cid = 'nintidetect-' + socket.gethostname()
-                s.sendall(_mqtt_connect_packet(cid, mc['username'], mc['password']))
-                resp = s.recv(4)
-                if len(resp) < 4 or resp[0] != 0x20 or resp[3] != 0:
-                    raise RuntimeError(f'connect refused {resp!r}')
-                for topic, payload, retain in messages:
-                    s.sendall(_mqtt_publish_packet(topic, payload, retain))
-                try:
-                    s.shutdown(socket.SHUT_WR)
-                except Exception:
-                    pass
-                time.sleep(0.05)
+                s.sendall(blob)
+                _mqtt_last_tx = time.time()
                 mqtt_state['last_error'] = ''
-                mqtt_state['last_pub'] = time.time()
+                mqtt_state['last_pub'] = _mqtt_last_tx
                 return True
-            finally:
-                try: s.close()
-                except Exception: pass
+            except Exception as e:
+                # A socket the broker has already dropped only fails on the
+                # next write, so one immediate reconnect keeps that invisible.
+                _mqtt_close_locked(f'send failed: {e}')
+                if attempt == 2:
+                    mqtt_state['last_error'] = str(e)
+                    return False
+                _mqtt_retry_at = 0.0      # the one retry is not gated by backoff
+    return False
+
+
+def _mqtt_keepalive_loop():
+    global _mqtt_last_tx, _mqtt_ping_at, _mqtt_ping_next
+    while True:
+        time.sleep(5.0)
+        try:
+            mc = _mqtt_enabled_cfg()
+            with mqtt_lock:
+                if not mc['enabled'] or not mc['host']:
+                    if _mqtt_sock is not None:
+                        _mqtt_close_locked('mqtt disabled')
+                    continue
+                if _mqtt_sock is None:
+                    # Re-establish here rather than waiting for the next publish,
+                    # so the retained availability goes back to 'online' promptly
+                    # after the will has fired. Still gated by the backoff.
+                    _mqtt_connect_locked(mc)
+                    continue
+                _mqtt_drain_locked()
+                if _mqtt_sock is None:
+                    continue
+                now = time.time()
+                if _mqtt_ping_at:
+                    if _mqtt_last_rx >= _mqtt_ping_at:
+                        _mqtt_ping_at = 0.0                 # answered
+                        _mqtt_ping_next = now + MQTT_PING_INTERVAL
+                    elif now - _mqtt_ping_at > MQTT_PING_TIMEOUT:
+                        _mqtt_close_locked(
+                            f'no PINGRESP within {MQTT_PING_TIMEOUT:.0f}s')
+                        _mqtt_ping_at = 0.0
+                elif now >= _mqtt_ping_next:
+                    try:
+                        _mqtt_sock.sendall(MQTT_PINGREQ)
+                        _mqtt_ping_at = now
+                        _mqtt_last_tx = now
+                    except Exception as e:
+                        _mqtt_close_locked(f'ping failed: {e}')
         except Exception as e:
-            mqtt_state['last_error'] = str(e)
-            return False
+            print(f'[mqtt] keepalive error: {e}', flush=True)
+
+
+def mqtt_shutdown():
+    """Say goodbye so the broker does not have to time us out."""
+    with mqtt_lock:
+        if _mqtt_sock is not None:
+            _mqtt_close_locked('sidecar shutting down')
 
 def _mqtt_device(mc):
     return {
@@ -924,6 +1146,72 @@ def _rewrite_event_index_without_deleted_videos():
     except Exception as e:
         print(f'[storage] index rewrite error: {e}', flush=True)
 
+def _event_dir_epoch(name):
+    """Save time from the dir name, e.g. event_00001_save_1785821317.
+
+    Ordering must not come from the dir mtime: reclaiming a duplicate
+    event.h264 rewrites the parent dir's mtime, which would make every
+    touched event look brand new and send the prune after the wrong ones.
+    """
+    try:
+        return float(name.rsplit('_save_', 1)[1])
+    except Exception:
+        return None
+
+
+_events_bytes_cache = {'bytes': 0, 'ts': 0.0}
+EVENTS_BYTES_TTL = 180.0
+
+
+def _events_bytes_refresh():
+    try:
+        _events_bytes_cache['bytes'] = _dir_bytes(EVENT_DIR)
+        _events_bytes_cache['ts'] = time.time()
+    finally:
+        _events_bytes_cache['running'] = False
+    return _events_bytes_cache['bytes']
+
+
+def _events_bytes_cached(nonblocking=False):
+    """Size of the events dir, recomputed at most every EVENTS_BYTES_TTL.
+
+    Walking it is ~2000 directories and ~13000 files.  Doing that inside a
+    request handler timed /api/clips out, so callers on the HTTP path pass
+    nonblocking=True: they get the last known number immediately and a refresh
+    runs behind them.  The retention loop publishes the same total every 5
+    minutes anyway, so the cache is never far behind.
+    """
+    if time.time() - _events_bytes_cache['ts'] < EVENTS_BYTES_TTL:
+        return _events_bytes_cache['bytes']
+    if nonblocking:
+        if not _events_bytes_cache.get('running'):
+            _events_bytes_cache['running'] = True
+            threading.Thread(target=_events_bytes_refresh, daemon=True).start()
+        return _events_bytes_cache['bytes']
+    return _events_bytes_refresh()
+
+
+def _dir_bytes(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _events_max_bytes():
+    with config_lock:
+        v = cfg.get('events_max_gb', EVENT_DEFAULT_MAX_GB)
+    try:
+        v = float(v)
+    except Exception:
+        v = EVENT_DEFAULT_MAX_GB
+    return int(max(0.5, min(64.0, v)) * 1024 ** 3)
+
+
 def _cleanup_event_storage():
     try:
         os.makedirs(EVENT_DIR, exist_ok=True)
@@ -939,23 +1227,52 @@ def _cleanup_event_storage():
             except Exception:
                 pass
 
-        used = _disk_used_pct(EVENT_DIR)
-        if used < EVENT_STORAGE_MAX_USED_PCT:
-            return
+        # Events saved before the remux started dropping its source still
+        # carry both event.h264 and event.mp4.  The mp4 is a stream copy, so
+        # the h264 is pure duplication — reclaim it.
+        freed = 0
+        for name in os.listdir(EVENT_DIR):
+            if not (name.startswith('event_') and '_save_' in name):
+                continue
+            d = os.path.join(EVENT_DIR, name)
+            raw, mp4 = os.path.join(d, 'event.h264'), os.path.join(d, 'event.mp4')
+            try:
+                if os.path.exists(raw) and os.path.getsize(mp4) > 1024:
+                    freed += os.path.getsize(raw)
+                    os.remove(raw)
+            except OSError:
+                pass
+        if freed:
+            print(f'[storage] dropped {freed / 1073741824.0:.2f} GB of duplicate '
+                  f'event.h264', flush=True)
 
         event_dirs = []
+        total = 0
         for name in os.listdir(EVENT_DIR):
             if not (name.startswith('event_') and '_save_' in name):
                 continue
             path = os.path.join(EVENT_DIR, name)
             if os.path.isdir(path):
-                event_dirs.append((os.path.getmtime(path), path))
+                age = _event_dir_epoch(name)
+                if age is None:
+                    age = os.path.getmtime(path)
+                event_dirs.append((age, path))
+                total += _dir_bytes(path)
+        budget = _events_max_bytes()
+        _events_bytes_cache['bytes'] = total
+        _events_bytes_cache['ts'] = time.time()
+        if total <= budget and _disk_used_pct(EVENT_DIR) < EVENT_STORAGE_MAX_USED_PCT:
+            return
+
         event_dirs.sort()
         deleted = 0
         for _mtime, path in event_dirs:
-            if _disk_used_pct(EVENT_DIR) <= EVENT_STORAGE_TARGET_USED_PCT:
+            if (total <= budget
+                    and _disk_used_pct(EVENT_DIR) <= EVENT_STORAGE_TARGET_USED_PCT):
                 break
+            sz = _dir_bytes(path)
             shutil.rmtree(path)
+            total -= sz
             deleted += 1
             print(f'[storage] deleted old event {path}', flush=True)
         if deleted:
@@ -963,6 +1280,421 @@ def _cleanup_event_storage():
             print(f'[storage] cleanup done used={_disk_used_pct(EVENT_DIR):.1f}%', flush=True)
     except Exception as e:
         print(f'[storage] cleanup error: {e}', flush=True)
+
+# ---- clip recorder ---------------------------------------------------------
+_clip_lock = threading.Lock()
+_clip_fp = None
+_clip_path = ''
+_clip_started = 0.0
+_clip_frames = 0
+_clip_tail = b''            # last 3 bytes seen, so a start code split across
+                            # two FIFO reads is still counted exactly once
+_clip_rotate_due = False
+_clip_remux_q = Queue()
+
+
+def _clips_enabled():
+    with config_lock:
+        return bool(cfg.get('clips_enabled', True))
+
+
+def _clip_secs():
+    with config_lock:
+        v = cfg.get('clips_secs', CLIP_DEFAULT_SECS)
+    try:
+        v = int(float(v))
+    except Exception:
+        v = CLIP_DEFAULT_SECS
+    return max(CLIP_MIN_SECS, min(3600, v))
+
+
+def _clip_max_bytes():
+    with config_lock:
+        v = cfg.get('clips_max_gb', CLIP_DEFAULT_MAX_GB)
+    try:
+        v = float(v)
+    except Exception:
+        v = CLIP_DEFAULT_MAX_GB
+    return int(max(0.5, min(64.0, v)) * 1024 ** 3)
+
+
+def _h264_scan(buf, want):
+    """Offsets of Annex-B start codes whose NAL type is in `want`.
+
+    bytes.find() keeps the scan at C speed.  The pure-Python byte loop in
+    _h264_start_codes() costs most of a second on a 256 KB chunk on this SoC,
+    and this runs inside the live FIFO reader.
+    """
+    out = []
+    n = len(buf)
+    pos = 0
+    while True:
+        i = buf.find(b'\x00\x00\x01', pos)
+        if i < 0 or i + 3 >= n:
+            return out
+        if (buf[i + 3] & 0x1f) in want:
+            out.append(i - 1 if i > 0 and buf[i - 1] == 0 else i)
+        pos = i + 3
+
+
+def _clip_count_vcl(part, carry):
+    """(slice NALs in `part`, new carry).  Types 1 and 5 are one picture each."""
+    if not part:
+        return 0, carry
+    scan = carry + part if carry else part
+    return len(_h264_scan(scan, (1, 5))), bytes(scan[-3:])
+
+
+def _clip_name_epoch(name):
+    try:
+        stamp = name.split('clip_', 1)[1].rsplit('.', 1)[0]
+        return time.mktime(time.strptime(stamp, '%Y%m%d_%H%M%S'))
+    except Exception:
+        return None
+
+
+def _clip_open_locked(now):
+    global _clip_fp, _clip_path, _clip_started, _clip_frames, _clip_rotate_due
+    os.makedirs(CLIP_DIR, exist_ok=True)
+    name = time.strftime('clip_%Y%m%d_%H%M%S', time.localtime(now))
+    path = os.path.join(CLIP_DIR, name + '.h264')
+    _clip_fp = open(path, 'wb', CLIP_WRITE_BUFFER)
+    _clip_path = path
+    _clip_started = now
+    _clip_frames = 0
+    _clip_rotate_due = False
+    print(f'[clips] start {path}', flush=True)
+
+
+def _clip_close_locked(now):
+    global _clip_fp, _clip_path, _clip_frames, _clip_rotate_due
+    if not _clip_fp:
+        return
+    path, frames = _clip_path, _clip_frames
+    span = max(0.1, now - _clip_started)
+    try:
+        _clip_fp.flush()
+        _clip_fp.close()
+    except Exception as e:
+        print(f'[clips] close error: {e}', flush=True)
+    _clip_fp = None
+    _clip_path = ''
+    _clip_frames = 0
+    _clip_rotate_due = False
+    if frames < 2 or not os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    _clip_remux_q.put((path, frames, span))
+
+
+def _clip_write(chunk):
+    """Tee one FIFO chunk into the rolling segment.  Called from the live reader."""
+    global _clip_frames, _clip_tail, _clip_rotate_due
+    if not chunk:
+        return
+    now = time.time()
+    if not _clips_enabled():
+        if _clip_fp is not None:
+            with _clip_lock:
+                _clip_close_locked(now)
+        return
+    with _clip_lock:
+        try:
+            if _clip_fp is None:
+                _clip_open_locked(now)
+            if not _clip_rotate_due and now - _clip_started >= _clip_secs():
+                _clip_rotate_due = True
+            # Cut only on an SPS, so every clip opens with SPS/PPS/IDR and
+            # decodes on its own.  CHN0 emits one every ~2s, so the cut lands
+            # within a couple of seconds of the target length.
+            cut = -1
+            if _clip_rotate_due:
+                sps = _h264_scan(chunk, (7,))
+                if sps:
+                    cut = sps[0]
+            head = chunk if cut < 0 else chunk[:cut]
+            if head:
+                _clip_fp.write(head)
+                n, _clip_tail = _clip_count_vcl(head, _clip_tail)
+                _clip_frames += n
+            if cut >= 0:
+                _clip_close_locked(now)
+                _clip_open_locked(now)
+                rest = chunk[cut:]
+                if rest:
+                    _clip_fp.write(rest)
+                    n, _clip_tail = _clip_count_vcl(rest, _clip_tail)
+                    _clip_frames += n
+        except Exception as e:
+            print(f'[clips] write error: {e}', flush=True)
+            try:
+                _clip_close_locked(now)
+            except Exception:
+                pass
+
+
+def _clip_index_path():
+    return os.path.join(CLIP_DIR, CLIP_INDEX_NAME)
+
+
+def _clip_index_add(name, started, duration, frames, fps):
+    """Record a finished clip's real duration.
+
+    The timeline needs to map a wall-clock instant to (clip, offset), and the
+    only place the true duration is known is the remux, which measured it.
+    Inferring it from the next clip's start time is right only while clips are
+    contiguous — it silently lies across a restart gap.
+    """
+    try:
+        with open(_clip_index_path(), 'a') as f:
+            f.write(json.dumps({'name': name, 'started': started,
+                                'duration': round(duration, 2), 'frames': frames,
+                                'fps': round(fps, 3)}, separators=(',', ':')) + '\n')
+    except Exception as e:
+        print(f'[clips] index write failed: {e}', flush=True)
+
+
+def _clip_index_read():
+    out = {}
+    try:
+        with open(_clip_index_path()) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get('name'):
+                    out[rec['name']] = rec
+    except OSError:
+        pass
+    return out
+
+
+def _clip_index_prune(existing_names):
+    """Drop index entries whose mp4 has been deleted by the budget."""
+    idx = _clip_index_read()
+    keep = [r for n, r in idx.items() if n in existing_names]
+    if len(keep) == len(idx):
+        return
+    keep.sort(key=lambda r: r.get('started') or 0)
+    try:
+        tmp = _clip_index_path() + '.tmp'
+        with open(tmp, 'w') as f:
+            for r in keep:
+                f.write(json.dumps(r, separators=(',', ':')) + '\n')
+        os.replace(tmp, _clip_index_path())
+    except Exception as e:
+        print(f'[clips] index prune failed: {e}', flush=True)
+
+
+def _clip_rows():
+    """Clips ascending by start, each with a real (or inferred) duration."""
+    idx = _clip_index_read()
+    rows = []
+    for _mtime, sz, p in _clip_files():
+        name = os.path.basename(p)
+        if not name.endswith('.mp4'):
+            continue
+        started = _clip_name_epoch(name)
+        if started is None:
+            continue
+        rows.append({'name': name, 'url': '/clip-video/' + name, 'size': sz,
+                     'mtime': _mtime, 'started': started,
+                     'duration': (idx.get(name) or {}).get('duration'),
+                     'fps': (idx.get(name) or {}).get('fps')})
+    rows.sort(key=lambda r: r['started'])
+    nominal = _clip_secs()
+    for i, r in enumerate(rows):
+        if r['duration']:
+            continue
+        # No index entry (clip predates the index): the next clip opens in the
+        # same call that closes this one, so its start is this one's end.
+        if i + 1 < len(rows):
+            gap = rows[i + 1]['started'] - r['started']
+            r['duration'] = gap if 0 < gap <= nominal * 2 else nominal
+        else:
+            r['duration'] = nominal
+    for r in rows:
+        r['end'] = r['started'] + r['duration']
+    return rows
+
+
+def _storage_info():
+    """What is actually left on the card, and who is using it."""
+    out = {}
+    try:
+        usage = shutil.disk_usage('/')
+        out['disk_total_gb'] = round(usage.total / 1073741824.0, 2)
+        out['disk_free_gb'] = round(usage.free / 1073741824.0, 2)
+        out['disk_used_pct'] = round(usage.used * 100.0 / max(1, usage.total), 1)
+    except Exception:
+        pass
+    rows = []
+    try:
+        rows = _clip_rows()
+        out['clips_gb'] = round(sum(r['size'] for r in rows) / 1073741824.0, 2)
+    except Exception:
+        out['clips_gb'] = 0
+    try:
+        out['events_gb'] = round(_events_bytes_cached(nonblocking=True) / 1073741824.0, 2)
+    except Exception:
+        out['events_gb'] = 0
+    try:
+        out['clips_max_gb'] = round(_clip_max_bytes() / 1073741824.0, 2)
+        out['events_max_gb'] = round(_events_max_bytes() / 1073741824.0, 2)
+    except Exception:
+        pass
+    try:
+        rate = 0
+        span = sum(r['duration'] for r in rows)
+        used = sum(r['size'] for r in rows)
+        if span > 60:
+            rate = used / span            # bytes per second of footage
+        if rate:
+            room = min(_clip_max_bytes() - used,
+                       max(0, shutil.disk_usage('/').free - CLIP_MIN_FREE_BYTES))
+            out['hours_recorded'] = round(span / 3600.0, 2)
+            out['hours_left'] = round(max(0, room) / rate / 3600.0, 1)
+    except Exception:
+        pass
+    return out
+
+
+def _export_clip_list(t_from, t_to):
+    """(list-file path, seek offset, duration) for a wall-clock range, or None."""
+    rows = [r for r in _clip_rows() if r['end'] > t_from and r['started'] < t_to]
+    if not rows:
+        return None
+    lines = []
+    for r in rows:
+        p = os.path.join(CLIP_DIR, r['name'])
+        if os.path.exists(p):
+            lines.append("file '%s'\n" % p)
+    if not lines:
+        return None
+    path = '/tmp/ninti_export_%d.txt' % int(time.time() * 1000)
+    with open(path, 'w') as f:
+        f.writelines(lines)
+    offset = max(0.0, t_from - rows[0]['started'])
+    return path, offset, (t_to - t_from)
+
+
+def _clip_files():
+    """[(mtime, size, path)] oldest first, for both .h264 and .mp4."""
+    out = []
+    try:
+        names = os.listdir(CLIP_DIR)
+    except OSError:
+        return out
+    for name in names:
+        if not name.startswith('clip_'):
+            continue
+        p = os.path.join(CLIP_DIR, name)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        out.append((st.st_mtime, st.st_size, p))
+    out.sort()
+    return out
+
+
+def _clip_enforce_budget():
+    """Drop oldest clips until under the byte budget and above the free floor."""
+    files = _clip_files()
+    if not files:
+        return
+    current = _clip_path
+    total = sum(sz for _m, sz, _p in files)
+    budget = _clip_max_bytes()
+    try:
+        free = shutil.disk_usage(CLIP_DIR).free
+    except OSError:
+        free = CLIP_MIN_FREE_BYTES
+    deleted = 0
+    for _mtime, sz, p in files:
+        if total <= budget and free >= CLIP_MIN_FREE_BYTES:
+            break
+        if p == current:
+            continue          # never delete the segment being written
+        try:
+            os.remove(p)
+        except OSError:
+            continue
+        total -= sz
+        free += sz
+        deleted += 1
+    if deleted:
+        _clip_index_prune({os.path.basename(p) for _m, _s, p in _clip_files()})
+        print(f'[clips] pruned {deleted} clip(s), now {total / 1073741824.0:.2f} GB '
+              f'free={free / 1073741824.0:.2f} GB', flush=True)
+
+
+def _clip_remux_loop():
+    while True:
+        try:
+            path, frames, span = _clip_remux_q.get()
+        except Exception:
+            time.sleep(1)
+            continue
+        try:
+            # Annex-B carries no timestamps.  Real slice count over real
+            # wall-clock span is the only fps that plays back at true speed —
+            # guessing from configured fps is what made event clips look slow.
+            fps = max(0.5, min(60.0, frames / span))
+            out = (path[:-5] if path.endswith('.h264') else path) + '.mp4'
+            t0 = time.time()
+            subprocess.check_call([
+                'ffmpeg', '-y', '-loglevel', 'error', '-fflags', '+genpts',
+                '-framerate', _fmt_fps(fps), '-f', 'h264', '-i', path,
+                '-c:v', 'copy', out,
+            ], timeout=600)
+            if os.path.exists(out) and os.path.getsize(out) > 1024:
+                os.remove(path)
+                _clip_index_add(os.path.basename(out),
+                                _clip_name_epoch(os.path.basename(out)) or (time.time() - span),
+                                span, frames, fps)
+                print(f'[clips] remux {os.path.basename(out)} frames={frames} '
+                      f'span={span:.1f}s fps={fps:.2f} in {time.time() - t0:.1f}s',
+                      flush=True)
+            else:
+                print(f'[clips] remux produced nothing for {path}', flush=True)
+        except Exception as e:
+            print(f'[clips] remux failed {path}: {e}', flush=True)
+        try:
+            _clip_enforce_budget()
+        except Exception as e:
+            print(f'[clips] budget error: {e}', flush=True)
+
+
+def _clip_startup_recover():
+    """Remux or drop .h264 left behind by a crash, then apply the budget."""
+    try:
+        os.makedirs(CLIP_DIR, exist_ok=True)
+        for _mtime, sz, p in _clip_files():
+            if not p.endswith('.h264'):
+                continue
+            started = _clip_name_epoch(os.path.basename(p))
+            if sz < 4096 or started is None:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+                continue
+            span = max(1.0, os.path.getmtime(p) - started)
+            with config_lock:
+                nominal = float(cfg.get('ws_fps', cfg.get('hls_fps', 10)) or 10)
+            _clip_remux_q.put((p, max(2, int(span * nominal)), span))
+    except Exception as e:
+        print(f'[clips] startup recover error: {e}', flush=True)
+    _clip_enforce_budget()
+
 
 def _storage_cleanup_loop():
     while True:
@@ -1116,6 +1848,13 @@ def _finish_event_video(tr, save, now):
     else:
         record_fps = _effective_record_fps(rec['fps'])
     ok = _run_ffmpeg(frames_dir, out_mp4, rec['fps'], h264_in, record_fps)
+    if ok and os.path.exists(h264_in):
+        # The mp4 is a stream copy of this file, so keeping both doubled the
+        # events dir (9.69 GB of duplicate .h264 on 192.168.100.196).
+        try:
+            os.remove(h264_in)
+        except OSError as e:
+            print(f'[events] could not drop {h264_in}: {e}', flush=True)
     if ok and not thumb_ok:
         # Decoding a 2560x1440 mp4 to extract one frame at native size
         # pushed ffmpeg over the OOM ceiling on this 128 MB box (sidecar +
@@ -1359,6 +2098,7 @@ def _live_ws_reader_loop():
                     if not chunk:
                         break
                     _ws_live_broadcast(chunk)
+                    _clip_write(chunk)
             except OSError as e:
                 print(f'[wslive] reader error: {e}')
                 if fd is not None:
@@ -1505,6 +2245,78 @@ def _proc_state(pid):
     except Exception:
         return None
 
+def _reboot_note(event, reason=''):
+    """Append one durable line (plus a state snapshot) to REBOOT_LOG.
+
+    `reboot -f` does not sync, so this fsyncs before returning — without that
+    the line describing the reboot is the thing the reboot throws away.
+    """
+    try:
+        parts = [time.strftime('%Y-%m-%d %H:%M:%S'), event]
+        if reason:
+            parts.append(reason)
+        try:
+            with open('/proc/uptime') as f:
+                parts.append('uptime=%ss' % f.read().split()[0])
+        except Exception:
+            pass
+        try:
+            with open('/proc/loadavg') as f:
+                parts.append('load=%s' % ' '.join(f.read().split()[:3]))
+        except Exception:
+            pass
+        try:
+            with open('/proc/meminfo') as f:
+                mi = dict(l.split(':', 1) for l in f if ':' in l)
+            parts.append('memfree=%s memavail=%s'
+                         % (mi.get('MemFree', '?').strip(), mi.get('MemAvailable', '?').strip()))
+        except Exception:
+            pass
+        try:
+            with yolo_lock:
+                proc = yolo_proc
+                pid = proc.pid if proc and proc.poll() is None else None
+            if pid:
+                with open('/proc/%d/status' % pid) as f:
+                    st = dict(l.split(':', 1) for l in f if ':' in l)
+                parts.append('yolo_pid=%d rss=%s data=%s state=%s'
+                             % (pid, st.get('VmRSS', '?').strip(),
+                                st.get('VmData', '?').strip(), st.get('State', '?').strip()))
+            else:
+                parts.append('yolo_pid=none')
+        except Exception:
+            pass
+        try:
+            usage = shutil.disk_usage('/')
+            parts.append('disk_free=%.2fGB' % (usage.free / 1073741824.0))
+        except Exception:
+            pass
+        line = ' | '.join(parts) + '\n'
+
+        old = []
+        try:
+            with open(REBOOT_LOG) as f:
+                old = f.readlines()[-(REBOOT_LOG_KEEP_LINES - 1):]
+        except Exception:
+            pass
+        with open(REBOOT_LOG, 'w') as f:
+            f.writelines(old)
+            f.write(line)
+            if event != 'BOOT':
+                # Whatever stream_yolo said last is usually the whole story.
+                try:
+                    with open('/tmp/stream_yolo.log') as sf:
+                        for tail in sf.readlines()[-15:]:
+                            f.write('    yolo> ' + tail.rstrip() + '\n')
+                except Exception:
+                    pass
+            f.flush()
+            os.fsync(f.fileno())
+        print('[reboot-log] %s' % line.strip(), flush=True)
+    except Exception as e:
+        print('[reboot-log] failed: %s' % e, flush=True)
+
+
 def _watchdog():
     global _dstate_count
     import subprocess as _sp
@@ -1523,6 +2335,7 @@ def _watchdog():
             # sensor, so the only reliable recovery is reboot. (Verified
             # 2026-06-12: post-OOM respawn -> CVI_VI_EnableChn c002800c.)
             print(f'[watchdog] stream_yolo pid {pid} died (exit={exit_code}); rebooting')
+            _reboot_note('WATCHDOG_REBOOT', f'stream_yolo pid {pid} died exit={exit_code}')
             _sp.call(['reboot', '-f'])
             time.sleep(60)
             continue
@@ -1532,6 +2345,8 @@ def _watchdog():
             print(f'[watchdog] stream_yolo pid {pid} D-state ({_dstate_count}/3)')
             if _dstate_count >= 6:
                 print('[watchdog] D-state persistent, rebooting')
+                _reboot_note('WATCHDOG_REBOOT',
+                             f'stream_yolo pid {pid} stuck in D-state for {_dstate_count * 10}s')
                 _sp.call(['reboot', '-f'])
         else:
             _dstate_count = 0
@@ -2996,10 +3811,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
 
     def _serve_event_file(self, path, head_only=False):
-        rel = path[len('/event-video/'):]
+        if path.startswith('/clip-video/'):
+            prefix, base = '/clip-video/', CLIP_DIR
+        else:
+            prefix, base = '/event-video/', EVENT_DIR
+        rel = path[len(prefix):]
         rel = os.path.normpath(rel).lstrip('/')
-        full = os.path.abspath(os.path.join(EVENT_DIR, rel))
-        root = os.path.abspath(EVENT_DIR)
+        full = os.path.abspath(os.path.join(base, rel))
+        root = os.path.abspath(base)
         if not full.startswith(root + os.sep) or not os.path.exists(full):
             self.send_response(404)
             self.end_headers()
@@ -3062,7 +3881,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = urlparse(self.path).path
-        if path.startswith('/event-video/'):
+        if path.startswith('/event-video/') or path.startswith('/clip-video/'):
             self._serve_event_file(path, head_only=True)
         elif path in ('/', '/index.html', '/api/status', '/api/config', '/api/events'):
             self.send_response(200)
@@ -3167,8 +3986,156 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(rows).encode())
 
-        elif path.startswith('/event-video/'):
+        elif path.startswith('/event-video/') or path.startswith('/clip-video/'):
             self._serve_event_file(path)
+
+        elif path == '/api/export.mp4':
+            # Streamed, never written to the card: the card is already split
+            # between clips and events and has no room for a spare copy.
+            q = parse_qs(urlparse(self.path).query)
+
+            def _num(key, default=0.0):
+                try:
+                    return float((q.get(key) or [default])[0])
+                except Exception:
+                    return float(default)
+
+            t_from, t_to = _num('from'), _num('to')
+            tz_min = _num('tz', 0)
+            span = t_to - t_from
+            if span < EXPORT_MIN_SECS or span > EXPORT_MAX_SECS:
+                self.send_response(400)
+                self._cors()
+                self.end_headers()
+                self.wfile.write(('range must be %d-%d seconds, got %.0f'
+                                  % (EXPORT_MIN_SECS, EXPORT_MAX_SECS, span)).encode())
+                return
+            if not _export_lock.acquire(blocking=False):
+                self.send_response(429)
+                self._cors()
+                self.end_headers()
+                self.wfile.write(b'an export is already running')
+                return
+            proc = None
+            listfile = None
+            try:
+                built = _export_clip_list(t_from, t_to)
+                if not built:
+                    self.send_response(404)
+                    self._cors()
+                    self.end_headers()
+                    self.wfile.write(b'no recording covers that range')
+                    return
+                listfile, offset, duration = built
+                stamp = time.strftime('%Y%m%d_%H%M',
+                                      time.gmtime(t_from + tz_min * 60))
+                name = 'ninti_%s_%dmin.mp4' % (stamp, max(1, round(duration / 60.0)))
+                cmd = ['nice', '-n', '19', 'ffmpeg', '-v', 'error',
+                       '-f', 'concat', '-safe', '0', '-i', listfile,
+                       '-ss', '%.2f' % offset, '-t', '%.2f' % duration,
+                       '-c', 'copy', '-avoid_negative_ts', 'make_zero',
+                       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                       '-f', 'mp4', 'pipe:1']
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/mp4')
+                self.send_header('Content-Disposition', 'attachment; filename="%s"' % name)
+                self.send_header('Cache-Control', 'no-store')
+                self._cors()
+                self.end_headers()
+                print(f'[export] {name} from={t_from:.0f} span={duration:.0f}s '
+                      f'offset={offset:.1f}s', flush=True)
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                print('[export] client went away, stopping ffmpeg', flush=True)
+            except Exception as e:
+                print(f'[export] failed: {e}', flush=True)
+            finally:
+                if proc:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(3)
+                        except Exception:
+                            proc.kill()
+                if listfile:
+                    try:
+                        os.remove(listfile)
+                    except OSError:
+                        pass
+                _export_lock.release()
+
+        elif path == '/api/clip-marks':
+            # Detection marks for the recording timeline: where to look, not
+            # what the motion level was.  Cheap enough to rebuild per request.
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                since = float((q.get('since') or ['0'])[0] or 0)
+            except Exception:
+                since = 0.0
+            marks = []
+            try:
+                # Tail-read only. Parsing the whole index (2000+ events, ~1 MB)
+                # timed the request out on the device, and marks are appended
+                # in time order, so the tail is exactly the recent window.
+                if os.path.exists(EVENT_FILE):
+                    size = os.path.getsize(EVENT_FILE)
+                    with open(EVENT_FILE) as f:
+                        if size > CLIP_MARKS_TAIL_BYTES:
+                            f.seek(size - CLIP_MARKS_TAIL_BYTES)
+                            f.readline()          # drop the partial line
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                rec = json.loads(line)
+                            except Exception:
+                                continue
+                            t = rec.get('first_seen') or rec.get('t') or 0
+                            if t < since:
+                                continue
+                            marks.append({'t': t, 'cat': rec.get('cat'),
+                                          'd': rec.get('duration_s') or 0})
+                marks = marks[-1500:]
+            except Exception as e:
+                print(f'[clips] marks error: {e}')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(json.dumps(marks).encode())
+
+        elif path == '/api/clips':
+            rows = []
+            try:
+                rows = list(reversed(_clip_rows()))
+            except Exception as e:
+                print(f'[clips] list error: {e}')
+            info = {
+                'enabled': _clips_enabled(),
+                'secs': _clip_secs(),
+                'max_gb': round(_clip_max_bytes() / 1073741824.0, 2),
+                'used_gb': round(sum(r['size'] for r in rows) / 1073741824.0, 2),
+                'recording': _clip_fp is not None,
+                'pending_remux': _clip_remux_q.qsize(),
+                'storage': _storage_info(),
+                'clips': rows,
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(json.dumps(info).encode())
 
         elif path in ('/hls.min.js', '/jmuxer.min.js'):
             js_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path.lstrip('/'))
@@ -3403,6 +4370,7 @@ class Handler(BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
+            _reboot_note('MANUAL_REBOOT', 'requested via /api/reboot')
             threading.Thread(target=lambda: (__import__('time').sleep(0.3), __import__('subprocess').call(['reboot'])), daemon=True).start()
 
         elif path == '/api/shutdown':
@@ -3458,17 +4426,27 @@ if __name__ == '__main__':
 
     def _graceful_exit(signum, frame):
         print('[main] signal received, stopping yolo before exit')
+        mqtt_shutdown()
         stop_yolo()
         raise SystemExit(0)
 
     _signal.signal(_signal.SIGTERM, _graceful_exit)
 
+    try:
+        with open('/proc/uptime') as _f:
+            _up = float(_f.read().split()[0])
+    except Exception:
+        _up = 0.0
+    _reboot_note('BOOT' if _up < 120 else 'SIDECAR_START')
     threading.Thread(target=udp_listener, daemon=True).start()
     threading.Thread(target=_watchdog, daemon=True).start()
     threading.Thread(target=_rss_logger, daemon=True).start()
     threading.Thread(target=_motion_detector, daemon=True).start()
     threading.Thread(target=_storage_cleanup_loop, daemon=True).start()
+    threading.Thread(target=_clip_remux_loop, daemon=True).start()
+    threading.Thread(target=_clip_startup_recover, daemon=True).start()
     threading.Thread(target=_ws_status_loop, daemon=True).start()
+    threading.Thread(target=_mqtt_keepalive_loop, daemon=True).start()
 
     # Apply saved mode on startup
     saved_mode = cfg.get('mode', 'ninti')
